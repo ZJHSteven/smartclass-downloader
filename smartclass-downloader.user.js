@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
 // @namespace    https://example.local/
-// @version      0.4
-// @description  解析“相关推荐”列表(NewID+title)，按日期队列打开后台播放页；在每个页里通过拦截 XHR/fetch/DOM 捕获 mp4 URL 并 GM_download 自动下载。
+// @version      0.5
+// @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
 // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @grant        GM_download
 // @grant        GM_openInTab
@@ -47,6 +47,68 @@
     return (meta.match(/(\d{4}-\d{2}-\d{2})/) || [,''])[1];
   }
 
+  // 从 PlayFileUri 推导出 mp4 地址（带/不带 authKey 两个版本）
+  function mp4FromPlayUri(playUri) {
+    if (!playUri) return { withKey: '', noKey: '' };
+    // content.html 替换为 VGA.mp4，保留 query 参数（timestamp/authKey）
+    const withKey = playUri.replace(/content\.html(\?.*)?$/i, 'VGA.mp4$1');
+    // 不带参数的纯净版本
+    const noKey = withKey.split('?')[0];
+    return { withKey, noKey };
+  }
+
+  // 从 API 返回的 Value 对象构建文件名
+  function buildFilenameFromApi(v) {
+    const teacher = (v.TeacherList && v.TeacherList[0] && v.TeacherList[0].Name) ? v.TeacherList[0].Name : '未知教师';
+    const date = (v.StartTime || '').slice(0, 10);
+    const st = (v.StartTime || '').slice(11, 16).replace(':', '-');
+    const et = (v.StopTime || '').slice(11, 16).replace(':', '-');
+    const courseName = v.CourseName || '课程';
+    const classroom = v.ClassRoomName || '';
+    return sanitizeFilename(`${date}_${courseName}_${teacher}_${classroom}_${st}-${et}.mp4`);
+  }
+
+  // 获取 csrkToken（从页面或cookie）
+  function getCsrkToken() {
+    // 尝试从 URL 参数获取
+    const fromUrl = getParam('csrkToken');
+    if (fromUrl) return fromUrl;
+    
+    // 尝试从 cookie 获取
+    const match = document.cookie.match(/csrkToken=([^;]+)/);
+    if (match) return match[1];
+    
+    // 尝试从页面脚本中查找（有些站点会写在全局变量）
+    if (window.csrkToken) return window.csrkToken;
+    
+    // 默认返回空（某些情况下不需要token也能访问）
+    return '';
+  }
+
+  // 调用 API 获取视频信息
+  async function getVideoInfoByNewId(newId) {
+    const csrkToken = getCsrkToken();
+    const url = new URL('/Video/GetVideoInfoDtoByID', location.origin);
+    url.searchParams.set('csrkToken', csrkToken);
+    url.searchParams.set('NewId', newId);
+    url.searchParams.set('isGetLink', 'true');
+    url.searchParams.set('VideoPwd', '');
+    url.searchParams.set('Answer', '');
+    url.searchParams.set('isloadstudent', 'true');
+
+    try {
+      const resp = await fetch(url.toString(), { credentials: 'include' });
+      const json = await resp.json();
+      if (!json?.Success) {
+        throw new Error(json?.Message || 'API返回失败');
+      }
+      return json.Value;
+    } catch (err) {
+      log('[API错误]', newId, err.message);
+      throw err;
+    }
+  }
+
   /******************* UI + 日志 *******************/
   const panel = document.createElement('div');
   panel.style.cssText = `
@@ -59,7 +121,7 @@
   `;
   panel.innerHTML = `
     <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
-      <div style="font-weight:900;">智慧课堂下载助手（队列版）</div>
+      <div style="font-weight:900;">智慧课堂下载助手（API加速版）</div>
       <button id="tm_clear" style="cursor:pointer; padding:4px 8px;">清空日志</button>
     </div>
     <div id="tm_info" style="opacity:.85; margin:6px 0 10px;"></div>
@@ -73,7 +135,7 @@
     </div>
 
     <div style="opacity:.75; margin-bottom:8px;">
-      说明：不靠自动播放。页面一旦“请求/返回/DOM中出现 mp4 链接”，就抓到并触发下载。
+      说明：通过API直接获取视频信息，秒级生成下载任务。支持队列模式批量下载。
     </div>
 
     <details style="margin-bottom:8px;">
@@ -84,6 +146,7 @@
     <div id="tm_list"></div>
   `;
   document.documentElement.appendChild(panel);
+  window.__tm_panel = panel; // 保存面板引用供其他功能使用
 
   const logEl = qs('#tm_log', panel);
   function log(...args) {
@@ -240,6 +303,92 @@
     log(`队列加入 ${items.length} 条，当前队列总数=${q.length}`);
   }
 
+  // 通过 API 直接下载（不再打开后台页）
+  async function downloadByApi(item) {
+    const doneKey = `tm_done_${item.newId}_${item.filename}`;
+    if (localStorage.getItem(doneKey) === '1') {
+      log('[跳过] 已下载过：', item.filename);
+      return;
+    }
+
+    try {
+      log('[API] 获取视频信息：', item.newId);
+      const v = await getVideoInfoByNewId(item.newId);
+      
+      const segments = v.VideoSegmentInfo || [];
+      if (!segments.length) {
+        log('[API] 无视频片段：', item.newId);
+        return;
+      }
+
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        const { withKey, noKey } = mp4FromPlayUri(seg.PlayFileUri);
+        
+        if (!withKey) {
+          log('[API] 无法解析 mp4 地址：', seg.PlayFileUri);
+          continue;
+        }
+
+        let fn = buildFilenameFromApi(v);
+        if (segments.length > 1) {
+          fn = fn.replace('.mp4', `_seg${i + 1}.mp4`);
+        }
+
+        log('[API] 开始下载：', fn);
+        gmDownloadWithFallback(withKey, noKey, fn, doneKey);
+      }
+    } catch (err) {
+      log('[API失败] 降级为后台页模式：', item.newId, err.message);
+      openBackupTab(item);
+    }
+  }
+
+  // 备用方案：打开后台页（当API失败时使用）
+  function openBackupTab(item) {
+    const u = new URL(item.url);
+    u.searchParams.set('tm_autodl', '1');
+    u.searchParams.set('tm_fn', item.filename);
+    u.searchParams.set('tm_newid', item.newId);
+    log('[备用] 打开后台页：', u.toString());
+    GM_openInTab(u.toString(), { active: false, insert: true, setParent: true });
+  }
+
+  // 队列处理器（支持并发）
+  let lastQueueSize = -1;
+  async function processQueue(concurrency = 3) {
+    const inflightKey = 'tm_inflight';
+    const inflight = Number(localStorage.getItem(inflightKey) || '0');
+    const q = loadQueue();
+    
+    if (q.length !== lastQueueSize) {
+      if (q.length === 0) {
+        if (lastQueueSize > 0) log('[队列] 全部完成');
+      } else {
+        log(`[队列] 剩余 ${q.length} 个任务`);
+      }
+      lastQueueSize = q.length;
+    }
+
+    if (q.length === 0) return;
+    if (inflight >= concurrency) return;
+
+    const next = q.shift();
+    saveQueue(q);
+    lastQueueSize = q.length;
+
+    localStorage.setItem(inflightKey, String(inflight + 1));
+
+    try {
+      await downloadByApi(next);
+    } finally {
+      const current = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
+      localStorage.setItem(inflightKey, String(current));
+    }
+  }
+
+  setInterval(() => processQueue(3), 1000);
+
   function openNextFromQueue(concurrency = 2) {
     // 用 localStorage 做一个很轻量的“并发计数”
     const inflightKey = 'tm_inflight';
@@ -271,8 +420,7 @@
     GM_openInTab(u.toString(), { active: false, insert: true, setParent: true });
   }
 
-  // 队列调度器：每 1.5 秒尝试开一个
-  setInterval(() => openNextFromQueue(2), 1500);
+  // 旧的队列调度器已禁用，openNextFromQueue函数仅作为API失败时的降级备用
 
   /******************* 自动下载模式（后台页自己下载自己） *******************/
 function bytesHuman(n) {
@@ -339,8 +487,89 @@ function renderDlState() {
   }).join('');
 }
 
-// 这个就是你要替换的 gmDownload
-function gmDownload(url, filename) {
+// 带降级重试的下载函数（先试带参数，失败后试无参数）
+function gmDownloadWithFallback(urlWithKey, urlNoKey, filename, doneKey) {
+  const now = Date.now();
+  __tmDlState.set(filename, {
+    filename,
+    status: 'downloading',
+    loaded: 0,
+    total: -1,
+    speed: 0,
+    t0: now,
+    lastT: now,
+    lastLoaded: 0,
+    err: ''
+  });
+  renderDlState();
+  log('开始下载(带参数)：', filename);
+
+  GM_download({
+    url: urlWithKey,
+    name: filename,
+    saveAs: false,
+    timeout: 60000,
+
+    onprogress: (e) => {
+      const st = __tmDlState.get(filename);
+      if (!st) return;
+
+      const t = Date.now();
+      const loaded = (typeof e.loaded === 'number') ? e.loaded : st.loaded;
+      const total  = (typeof e.total === 'number') ? e.total : st.total;
+
+      const dt = Math.max(1, t - st.lastT);
+      const dL = Math.max(0, loaded - st.lastLoaded);
+      const speed = Math.floor((dL * 1000) / dt);
+
+      st.loaded = loaded;
+      st.total = total;
+      st.speed = speed;
+      st.lastT = t;
+      st.lastLoaded = loaded;
+
+      __tmDlState.set(filename, st);
+
+      if (!st.__lastRender || t - st.__lastRender > 300) {
+        st.__lastRender = t;
+        renderDlState();
+      }
+    },
+
+    onload: () => {
+      const st = __tmDlState.get(filename);
+      if (st) {
+        st.status = 'done';
+        st.speed = 0;
+          // ✅ 只有下载成功后才标记
+          if (doneKey) localStorage.setItem(doneKey, '1');
+        __tmDlState.set(filename, st);
+      }
+      renderDlState();
+      log('下载完成：', filename);
+    },
+
+    onerror: (err) => {
+      log('[降级] 带参数版本失败，尝试无参数版本：', filename);
+      // 降级到无参数版本
+      gmDownload(urlNoKey, filename, doneKey);
+    },
+
+    ontimeout: () => {
+      const st = __tmDlState.get(filename);
+      if (st) {
+        st.status = 'error';
+        st.err = '下载超时（网络不稳定/被节流）';
+        __tmDlState.set(filename, st);
+      }
+      renderDlState();
+      log('下载超时：', filename);
+    },
+  });
+}
+
+// 原有的 gmDownload 函数（现在作为降级方案）
+function gmDownload(url, filename, doneKey) {
   const now = Date.now();
   __tmDlState.set(filename, {
     filename,
@@ -384,6 +613,8 @@ function gmDownload(url, filename) {
       __tmDlState.set(filename, st);
 
       // 限流渲染，避免太频繁
+        // ✅ 只有下载成功后才标记
+        if (doneKey) localStorage.setItem(doneKey, '1');
       if (!st.__lastRender || t - st.__lastRender > 300) {
         st.__lastRender = t;
         renderDlState();
