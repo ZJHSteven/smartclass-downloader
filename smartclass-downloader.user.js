@@ -1,19 +1,132 @@
 // ==UserScript==
-// @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
-// @namespace    https://example.local/
-// @version      0.5
-// @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
-// @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
-// @grant        GM_download
-// @grant        GM_openInTab
+  // @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
+  // @namespace    https://github.com/ZJHSteven/smartclass-downloader
+  // @version      0.6
+  // @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
+  // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
+  // @run-at      document-start
+  // @grant        GM_download
+  // @grant        GM_openInTab
 // ==/UserScript==
 
 (function () {
   'use strict';
 
+  /************* csrkToken 捕获与缓存（核心修复） *************
+   *
+   * 你遇到的典型报错：Success=false, Message="验证不通过"
+   * 99% 都是 csrkToken 没拿到 / 拿错了 / 为空导致的。
+   *
+   * 旧逻辑的问题：只“猜”token 在 URL / cookie / window 变量里；
+   * 但实际站点很可能：
+   * - token 根本不在 URL
+   * - token 放在 HttpOnly Cookie（JS 读不到）
+   * - 或者 token 只在页面自己发的网络请求里出现
+   *
+   * 新逻辑（更稳）：
+   * - 脚本尽早运行（metadata 里加 @run-at document-start）
+   * - hook XHR / fetch 时，遇到 /Video/GetVideoInfoDtoByID 就把请求里的 csrkToken 抠出来
+   * - 抠到后写入 localStorage，后续 API 直接复用，不再“猜”
+   ***********************************************************/
+  const CSRK_STORE_KEY = 'tm_csrkToken_v2'; // localStorage 的 key（改版本号避免污染旧值）
+  let __tmCsrkToken = '';                  // 运行时内存缓存：优先读它，避免每次都碰 localStorage
+
+  // 读取历史缓存（在某些隐私模式下 localStorage 可能会抛异常，所以要 try/catch）
+  try {
+    __tmCsrkToken = String(localStorage.getItem(CSRK_STORE_KEY) || '').trim();
+  } catch (e) {
+    __tmCsrkToken = '';
+  }
+
+  /**
+   * 记住并持久化 token。
+   * @param {string} tok - 从网络请求中抓到的 csrkToken
+   */
+  function rememberCsrkToken(tok) {
+    if (!tok) return;                  // 空值直接忽略
+    tok = String(tok).trim();          // 统一转字符串并去空白
+    if (tok.length < 6) return;        // 太短一般是无效值（避免把空串/0/1 之类写进去）
+
+    if (tok !== __tmCsrkToken) {       // 只在变化时写入，减少 localStorage 写频率
+      __tmCsrkToken = tok;
+      try { localStorage.setItem(CSRK_STORE_KEY, tok); } catch (e) {}
+      console.log('[TM] 捕获 csrkToken =', tok);
+    }
+  }
+
+  /**
+   * 从请求 body 中尝试提取 csrkToken（做一个更鲁棒的兜底）。
+   * 注意：大多数情况下 token 在 URL query 里即可，本函数属于“多做一步更稳”。
+   * @param {any} body - XHR.send(body) 或 fetch(init.body)
+   * @returns {string} 解析到的 token（解析不到返回空串）
+   */
+  function tryExtractCsrkTokenFromBody(body) {
+    if (!body) return '';
+
+    try {
+      // 1) 常见：application/x-www-form-urlencoded（字符串）
+      if (typeof body === 'string') {
+        const s = body.trim();
+        if (!s) return '';
+
+        // 1.1) 也有可能是 JSON 字符串
+        if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+          const obj = JSON.parse(s);
+          return (obj && (obj.csrkToken || obj.CsrkToken)) ? String(obj.csrkToken || obj.CsrkToken) : '';
+        }
+
+        // 1.2) 按 URLSearchParams 解析（foo=bar&csrkToken=xxx）
+        return new URLSearchParams(s).get('csrkToken') || '';
+      }
+
+      // 2) URLSearchParams
+      if (body instanceof URLSearchParams) {
+        return body.get('csrkToken') || '';
+      }
+
+      // 3) FormData
+      if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        const v = body.get('csrkToken');
+        return v ? String(v) : '';
+      }
+    } catch (e) {}
+
+    return '';
+  }
+
+  /**
+   * 从“任意 URL”里尝试识别目标接口，并提取 csrkToken。
+   * @param {string} urlStr - 请求 URL（可能是绝对/相对）
+   * @param {any} [body] - 可选：请求 body，用来做兜底提取
+   */
+  function tryExtractTokenFromAnyUrl(urlStr, body) {
+    try {
+      const u = new URL(urlStr, location.origin); // 兼容相对路径
+      if (u.pathname.toLowerCase() !== '/video/getvideoinfodtobyid') return;
+
+      // 先从 query 里拿（最常见）
+      rememberCsrkToken(u.searchParams.get('csrkToken'));
+
+      // 如果 query 没有，再从 body 兜底（少数站点会 POST）
+      if (!__tmCsrkToken) {
+        rememberCsrkToken(tryExtractCsrkTokenFromBody(body));
+      }
+    } catch (e) {}
+  }
+
   /******************* 工具 *******************/
   const qs = (s, r=document) => r.querySelector(s);
   const qsa = (s, r=document) => Array.from(r.querySelectorAll(s));
+
+  // HTML 转义：防止把页面里的 title 等内容直接塞 innerHTML 时触发“意外的 HTML 注入”
+  function escapeHtml(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
 
   function sanitizeFilename(name) {
     return String(name)
@@ -70,6 +183,9 @@
 
   // 获取 csrkToken（从页面或cookie）
   function getCsrkToken() {
+    // 0) 优先用我们“抓到并缓存”的 token（最可靠）
+    if (__tmCsrkToken) return __tmCsrkToken;
+
     // 尝试从 URL 参数获取
     const fromUrl = getParam('csrkToken');
     if (fromUrl) return fromUrl;
@@ -80,6 +196,15 @@
     
     // 尝试从页面脚本中查找（有些站点会写在全局变量）
     if (window.csrkToken) return window.csrkToken;
+
+    // 再兜底：从 localStorage 读（避免“刷新后内存缓存丢了”）
+    try {
+      const fromStore = String(localStorage.getItem(CSRK_STORE_KEY) || '').trim();
+      if (fromStore) {
+        __tmCsrkToken = fromStore;
+        return fromStore;
+      }
+    } catch (e) {}
     
     // 默认返回空（某些情况下不需要token也能访问）
     return '';
@@ -110,40 +235,232 @@
   }
 
   /******************* UI + 日志 *******************/
-  const panel = document.createElement('div');
-  panel.style.cssText = `
-    position:fixed; right:16px; bottom:16px; z-index:999999;
-    width:520px; max-height:60vh; overflow:auto;
-    background:#0b0f14; color:#eaf2ff; padding:12px;
-    border-radius:12px; font-size:12px; line-height:1.45;
-    box-shadow:0 10px 28px rgba(0,0,0,.45);
-    border:1px solid rgba(255,255,255,.10);
+  // 统一把 UI 样式抽出来：
+  // - 避免一坨 inline style 难维护
+  // - 颜色/对比度统一调，解决“灰字+灰底看不清”的问题
+  const tmStyle = document.createElement('style');
+  tmStyle.id = 'tm_style';
+  tmStyle.textContent = `
+    #tm_panel {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 999999;
+
+      width: min(540px, calc(100vw - 24px));
+      max-height: min(72vh, 820px);
+
+      display: flex;
+      flex-direction: column;
+
+      background: rgba(18, 22, 34, 0.92);
+      color: #f6f7ff;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 14px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(10px);
+
+      font: 12px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    #tm_panel * { box-sizing: border-box; }
+
+    #tm_panel .tm-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 12px 8px 12px;
+    }
+    #tm_panel .tm-title {
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: 0.2px;
+      color: #ffffff;
+    }
+    #tm_panel .tm-actions { display: flex; gap: 8px; }
+
+    #tm_panel .tm-body {
+      padding: 0 12px 12px 12px;
+      overflow: auto;
+    }
+
+    #tm_panel .tm-info {
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      color: rgba(255, 255, 255, 0.92);
+      margin-bottom: 10px;
+    }
+
+    #tm_panel .tm-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    #tm_panel .tm-label {
+      color: rgba(255, 255, 255, 0.92);
+      font-weight: 800;
+    }
+
+    #tm_panel .tm-select {
+      flex: 1;
+      min-width: 140px;
+      padding: 7px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      background: rgba(0, 0, 0, 0.18);
+      color: #ffffff;
+      outline: none;
+    }
+    #tm_panel .tm-select:focus {
+      border-color: rgba(79, 140, 255, 0.70);
+      box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.18);
+    }
+
+    #tm_panel .tm-btn {
+      appearance: none;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      background: rgba(255, 255, 255, 0.08);
+      color: #ffffff;
+      padding: 7px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 800;
+      user-select: none;
+      transition: background 120ms ease, border-color 120ms ease, transform 80ms ease;
+    }
+    #tm_panel .tm-btn:hover { background: rgba(255, 255, 255, 0.12); }
+    #tm_panel .tm-btn:active { transform: translateY(1px); }
+    #tm_panel .tm-btn.primary {
+      background: linear-gradient(135deg, rgba(79, 140, 255, 0.95), rgba(122, 92, 255, 0.95));
+      border-color: rgba(255, 255, 255, 0.22);
+    }
+    #tm_panel .tm-btn.ghost { background: transparent; }
+
+    #tm_panel .tm-help {
+      padding: 10px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.18);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      color: rgba(255, 255, 255, 0.90);
+      margin-bottom: 10px;
+    }
+    #tm_panel .tm-help-title { font-weight: 900; margin-bottom: 6px; }
+    #tm_panel .tm-help ul { margin: 0; padding-left: 18px; }
+    #tm_panel .tm-help li { margin: 4px 0; }
+    #tm_panel code { color: #d7e6ff; background: rgba(255, 255, 255, 0.08); padding: 1px 6px; border-radius: 8px; }
+
+    #tm_panel details.tm-details summary {
+      cursor: pointer;
+      font-weight: 900;
+      color: rgba(255, 255, 255, 0.94);
+      margin-bottom: 8px;
+      user-select: none;
+      list-style: none;
+    }
+    #tm_panel details.tm-details summary::-webkit-details-marker { display: none; }
+    #tm_panel .tm-log {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: rgba(0, 0, 0, 0.24);
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      color: rgba(245, 248, 255, 0.96);
+      margin: 0;
+    }
+
+    #tm_panel #tm_extra { margin: 10px 0; }
+
+    #tm_panel #tm_dl_box {
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.06);
+    }
+    #tm_panel .tm-dl-title { font-weight: 900; margin-bottom: 8px; }
+    #tm_panel .tm-dl-item {
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(0, 0, 0, 0.12);
+    }
+    #tm_panel .tm-dl-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    #tm_panel .tm-dl-name { opacity: 0.96; word-break: break-all; }
+    #tm_panel .tm-dl-status { font-weight: 900; white-space: nowrap; }
+    #tm_panel .tm-dl-status--done { color: #6dff7a; }
+    #tm_panel .tm-dl-status--error { color: #ff6b6b; }
+    #tm_panel .tm-dl-status--downloading { color: #8ab4ff; }
+    #tm_panel .tm-bar {
+      height: 8px;
+      background: rgba(255, 255, 255, 0.12);
+      border-radius: 999px;
+      overflow: hidden;
+      margin: 6px 0 8px 0;
+    }
+    #tm_panel .tm-bar > div { height: 100%; }
+    #tm_panel .tm-dl-detail { opacity: 0.90; }
+
+    #tm_panel .tm-list { display: flex; flex-direction: column; gap: 10px; }
+    #tm_panel .tm-item {
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(255, 255, 255, 0.06);
+    }
+    #tm_panel .tm-item-meta { font-weight: 900; color: #ffffff; margin-bottom: 6px; }
+    #tm_panel .tm-item-sub { color: rgba(255, 255, 255, 0.90); margin-top: 4px; }
+    #tm_panel .tm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    #tm_panel .tm-empty { color: rgba(255, 255, 255, 0.88); padding: 10px; }
   `;
+  document.documentElement.appendChild(tmStyle);
+
+  const panel = document.createElement('div');
+  panel.id = 'tm_panel';
   panel.innerHTML = `
-    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
-      <div style="font-weight:900;">智慧课堂下载助手（API加速版）</div>
-      <button id="tm_clear" style="cursor:pointer; padding:4px 8px;">清空日志</button>
-    </div>
-    <div id="tm_info" style="opacity:.85; margin:6px 0 10px;"></div>
-
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; align-items:center;">
-      <label style="opacity:.85;">选择日期：</label>
-      <select id="tm_date" style="padding:4px 6px;"></select>
-      <button id="tm_dl_date" style="cursor:pointer; font-weight:800; padding:4px 10px;">下载该日期（队列）</button>
-      <button id="tm_dl_latest" style="cursor:pointer; padding:4px 10px;">下载最新日期（队列）</button>
-      <button id="tm_dl_this" style="cursor:pointer; padding:4px 10px;">下载本页</button>
+    <div class="tm-header">
+      <div class="tm-title">智慧课堂下载助手（API加速版）</div>
+      <div class="tm-actions">
+        <button id="tm_toggle" class="tm-btn ghost" type="button" title="折叠/展开面板">折叠</button>
+        <button id="tm_clear" class="tm-btn" type="button" title="清空日志">清空日志</button>
+      </div>
     </div>
 
-    <div style="opacity:.75; margin-bottom:8px;">
-      说明：通过API直接获取视频信息，秒级生成下载任务。支持队列模式批量下载。
+    <div id="tm_body" class="tm-body">
+      <div id="tm_info" class="tm-info"></div>
+
+      <div class="tm-row">
+        <span class="tm-label">选择日期</span>
+        <select id="tm_date" class="tm-select"></select>
+        <button id="tm_dl_date" class="tm-btn primary" type="button">下载该日期（队列）</button>
+        <button id="tm_dl_latest" class="tm-btn" type="button">下载最新日期（队列）</button>
+        <button id="tm_dl_this" class="tm-btn" type="button">下载本页</button>
+      </div>
+
+      <div class="tm-help">
+        <div class="tm-help-title">使用提示</div>
+        <ul>
+          <li>脚本会从页面网络请求里捕获并缓存 <code>csrkToken</code>，解决“验证不通过”。</li>
+          <li>若“本页下载”提示没抓到 MP4，请先点一下播放触发取源请求。</li>
+        </ul>
+      </div>
+
+      <details class="tm-details" style="margin-bottom:10px;">
+        <summary>日志（点开看细节）</summary>
+        <pre id="tm_log" class="tm-log"></pre>
+      </details>
+
+      <div id="tm_extra"></div>
+      <div id="tm_list" class="tm-list"></div>
     </div>
-
-    <details style="margin-bottom:8px;">
-      <summary style="cursor:pointer; opacity:.9;">日志（点开看细节）</summary>
-      <pre id="tm_log" style="white-space:pre-wrap; word-break:break-word; background:#071018; padding:8px; border-radius:10px; margin-top:8px; border:1px solid rgba(255,255,255,.08);"></pre>
-    </details>
-
-    <div id="tm_list"></div>
   `;
   document.documentElement.appendChild(panel);
   window.__tm_panel = panel; // 保存面板引用供其他功能使用
@@ -156,6 +473,25 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
   qs('#tm_clear', panel).addEventListener('click', () => logEl.textContent = '');
+
+  // 面板折叠/展开：给屏幕留空间（把状态存到 localStorage，刷新后还能记住）
+  (function initPanelCollapse(){
+    const KEY = 'tm_ui_collapsed_v1';
+    const btn = qs('#tm_toggle', panel);
+    const body = qs('#tm_body', panel);
+
+    function setCollapsed(collapsed) {
+      body.style.display = collapsed ? 'none' : '';
+      btn.textContent = collapsed ? '展开' : '折叠';
+      try { localStorage.setItem(KEY, collapsed ? '1' : '0'); } catch (e) {}
+    }
+
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(KEY) === '1'; } catch (e) {}
+    setCollapsed(collapsed);
+
+    btn.addEventListener('click', () => setCollapsed(body.style.display !== 'none'));
+  })();
 
   /******************* 抓 mp4：XHR/fetch/DOM/资源兜底 *******************/
   const mp4Set = new Set();
@@ -179,10 +515,14 @@
 
     XMLHttpRequest.prototype.open = function(method, url, ...rest) {
       try { this.__tm_url = new URL(url, location.origin).toString(); } catch(e) { this.__tm_url = String(url); }
+      // 关键：尽早从“页面真实请求”里抠出 csrkToken（不再猜 token 在哪）
+      tryExtractTokenFromAnyUrl(this.__tm_url);
       return origOpen.call(this, method, url, ...rest);
     };
 
     XMLHttpRequest.prototype.send = function(body) {
+      // 再兜底一次：如果 token 放在 POST body（少见），这里也能抓到
+      tryExtractTokenFromAnyUrl(this.__tm_url || '', body);
       this.addEventListener('load', () => {
         const u = this.__tm_url || '';
         if (u.includes('.mp4')) addMp4(u, 'XHR-req');
@@ -206,6 +546,8 @@
     const origFetch = window.fetch;
     window.fetch = async function(input, init) {
       const url = typeof input === 'string' ? new URL(input, location.origin).toString() : (input && input.url) || '';
+      // 关键：fetch 也要抓一次（页面可能用 fetch 调用 GetVideoInfo）
+      tryExtractTokenFromAnyUrl(url, init && init.body);
       if (url.includes('.mp4')) addMp4(url, 'fetch-req');
 
       const res = await origFetch(input, init);
@@ -426,21 +768,15 @@ function bytesHuman(n) {
 }
 
 function ensureDlBox() {
-  // 把进度展示塞进面板里（你脚本里 panel 我之前让你挂到 window.__tm_panel 了）
-  const host = window.__tm_panel || document.body;
+  // 把进度展示塞进面板里：优先插到 tm_extra，避免打断主列表阅读
+  const host = qs('#tm_extra', panel) || window.__tm_panel || document.body;
   let box = host.querySelector('#tm_dl_box');
   if (!box) {
     box = document.createElement('div');
     box.id = 'tm_dl_box';
-    box.style.cssText = `
-      margin:8px 0; padding:10px;
-      border:1px solid rgba(255,255,255,.18);
-      border-radius:12px;
-      background:rgba(255,255,255,.04);
-    `;
     box.innerHTML = `
-      <div style="font-weight:800; margin-bottom:6px;">下载状态</div>
-      <div id="tm_dl_rows" style="display:flex; flex-direction:column; gap:8px;"></div>
+      <div class="tm-dl-title">下载状态</div>
+      <div id="tm_dl_rows" style="display:flex; flex-direction:column; gap:10px;"></div>
     `;
     host.appendChild(box);
   }
@@ -467,15 +803,15 @@ function renderDlState() {
         : (s.status === 'done' ? '完成' : (s.err || '失败'));
 
     return `
-      <div style="border:1px solid rgba(255,255,255,.10); border-radius:10px; padding:8px;">
-        <div style="display:flex; justify-content:space-between; gap:10px;">
-          <div style="opacity:.95; word-break:break-all;">${s.filename}</div>
-          <div style="color:${color}; font-weight:800; white-space:nowrap;">${s.status}</div>
+      <div class="tm-dl-item">
+        <div class="tm-dl-top">
+          <div class="tm-dl-name">${escapeHtml(s.filename)}</div>
+          <div class="tm-dl-status tm-dl-status--${escapeHtml(s.status)}">${escapeHtml(s.status)}</div>
         </div>
-        <div style="height:8px; background:rgba(255,255,255,.10); border-radius:999px; overflow:hidden; margin:6px 0;">
-          <div style="height:100%; width:${barW}%; background:${color};"></div>
+        <div class="tm-bar">
+          <div style="width:${barW}%; background:${color};"></div>
         </div>
-        <div style="opacity:.85;">${detail}</div>
+        <div class="tm-dl-detail">${escapeHtml(detail)}</div>
       </div>
     `;
   }).join('');
@@ -693,25 +1029,25 @@ function gmDownload(url, filename) {
     const rec = parseRecommendList();
 
     const info = qs('#tm_info', panel);
-    info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 已捕获MP4数=${mp4Set.size}`;
+    info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'}`;
 
     // 日期下拉
     const dates = uniq(rec.map(x => x.date)).sort();
     const sel = qs('#tm_date', panel);
-    sel.innerHTML = dates.map(d => `<option value="${d}">${d}</option>`).join('');
+    sel.innerHTML = dates.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
     if (dates.length) sel.value = getLatestDate(rec);
 
     // 列表展示
     const list = qs('#tm_list', panel);
     if (!rec.length) {
-      list.innerHTML = `<div style="opacity:.7;">未检测到相关推荐列表（ul.about_video）。</div>`;
+      list.innerHTML = `<div class="tm-empty">未检测到相关推荐列表（ul.about_video）。</div>`;
       return;
     }
     list.innerHTML = rec.map(it => `
-      <div style="border-top:1px solid rgba(255,255,255,.10); padding:8px 0;">
-        <div style="opacity:.95;">${it.meta}</div>
-        <div style="opacity:.75;">NewID=${it.newId}</div>
-        <div style="opacity:.75;">文件名=${it.filename}</div>
+      <div class="tm-item">
+        <div class="tm-item-meta">${escapeHtml(it.meta)}</div>
+        <div class="tm-item-sub">NewID：<span class="tm-mono">${escapeHtml(it.newId)}</span></div>
+        <div class="tm-item-sub">文件名：<span class="tm-mono">${escapeHtml(it.filename)}</span></div>
       </div>
     `).join('');
   }
