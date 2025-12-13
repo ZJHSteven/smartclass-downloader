@@ -1,7 +1,7 @@
 // ==UserScript==
   // @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-  // @version      0.6.1
+  // @version      0.6.2
   // @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
   // @run-at      document-start
@@ -143,17 +143,119 @@
     return Array.from(new Set(arr.filter(Boolean)));
   }
 
+  /******************* 文件命名（新规则 v2） *******************/
+  /**
+   * 【为什么要在这里集中处理命名？】
+   * - 命名规则经常改：集中在一处，后续只改这里就够了（不容易漏）。
+   * - 命名要尽量“短、好读、可排序”：你后面在资源管理器里一眼就能扫出来。
+   *
+   * 【你要求的新格式（示例）】
+   * - 旧：2025-12-12_人体功能学_张玲_第二教室_08-00-08-45.mp4（太长）
+   * - 新：12.12-生理-王栋-8-9.mp4
+   *
+   * 规则拆开讲：
+   * 1) 日期：只保留“月.日”，去掉年份；不要横杠，用点（12.9 / 11.29）
+   * 2) 课程：如果在对应表里有简写，就替换成简写；没有就保留原名
+   * 3) 老师：只保留老师名，不写教室/地点
+   * 4) 时间：只保留“小时”，不写分钟；用 “开始小时-结束小时”
+   */
+
+  /**
+   * 课程名 -> 简写 对应表
+   * - key：站点原始课程名（或常见写法）
+   * - value：你希望显示的简写
+   */
+  const COURSE_NAME_ALIAS = {
+    '人体功能学': '生理',
+    '病原与免疫': '病原',
+    '马克思主义基本原理': '马原',
+    '医学基础II': '生化',
+    '医学基础Ⅱ': '生化',
+    '医学术语学2': '英语',
+    '医学术语学Ⅱ': '英语'
+  };
+
+  /**
+   * 把“课程全名”转换成“简写”（如果表里有）
+   * @param {string} courseNameFull 课程全名（来自页面 title 或 API）
+   * @returns {string} 如果命中映射表则返回简写，否则返回原字符串（trim 后）
+   */
+  function abbreviateCourseName(courseNameFull) {
+    const raw = String(courseNameFull ?? '').trim(); // 统一成字符串，并去掉首尾空白
+    return COURSE_NAME_ALIAS[raw] || raw; // 命中映射表 -> 简写；否则保留原名
+  }
+
+  /**
+   * 把 YYYY-MM-DD 格式日期变成 “M.D”（去掉年份、去掉前导 0）
+   * @param {string} ymd 例如：2025-12-09
+   * @returns {string} 例如：12.9；解析失败时返回空串
+   */
+  function formatDateToMD(ymd) {
+    const m = String(ymd ?? '').match(/^(\d{4})-(\d{2})-(\d{2})$/); // 严格匹配年月日
+    if (!m) return ''; // 解析失败：交给调用者决定怎么兜底
+    const month = String(Number(m[2])); // Number(...) 会自动去掉前导 0（'09' -> 9）
+    const day = String(Number(m[3])); // 同上（'10' -> 10）
+    return `${month}.${day}`; // 按你的要求：用点，不要横杠
+  }
+
+  /**
+   * 从 “HH:mm” 中提取小时，返回不带前导 0 的字符串
+   * @param {string} hhmm 例如：08:45
+   * @returns {string} 例如：8；解析失败时返回空串
+   */
+  function extractHour(hhmm) {
+    const m = String(hhmm ?? '').match(/^(\d{2}):(\d{2})$/); // 只关心小时，分钟用来校验格式
+    if (!m) return ''; // 解析失败：交给调用者兜底
+    return String(Number(m[1])); // 去前导 0（'08' -> 8）
+  }
+
+  /**
+   * 拼出最终 mp4 文件名（统一出口）
+   * @param {object} x 输入信息（允许部分缺失，缺失会做兜底）
+   * @param {string} x.dateYmd YYYY-MM-DD
+   * @param {string} x.courseName 课程名（会走简写表）
+   * @param {string} x.teacherName 教师名
+   * @param {string} x.startHHmm 开始时间 HH:mm
+   * @param {string} x.endHHmm 结束时间 HH:mm
+   * @returns {string} 文件名（已 sanitize，带 .mp4）
+   */
+  function buildMp4FilenameV2({ dateYmd, courseName, teacherName, startHHmm, endHHmm }) {
+    const dateMd = formatDateToMD(dateYmd) || '未知日期'; // 日期尽量短；缺失时给一个可识别占位
+    const courseShort = abbreviateCourseName(courseName) || '课程'; // 课程名为空时兜底
+    const teacher = String(teacherName ?? '').trim() || '未知教师'; // 老师名为空时兜底
+    const startHour = extractHour(startHHmm) || '0'; // 小时提取失败时兜底（避免空字段导致连字符不好看）
+    const endHour = extractHour(endHHmm) || '0'; // 同上
+    return sanitizeFilename(`${dateMd}-${courseShort}-${teacher}-${startHour}-${endHour}.mp4`); // 统一用连字符分隔
+  }
+
   // 从 title="人体功能学 张玲 第二教室 2025-12-12 08:00:00-08:45:00"
-  // 生成文件名：2025-12-12_人体功能学_张玲_第二教室_08-00-08-45.mp4
+  // 生成文件名（新规则）：12.12-生理-张玲-8-8.mp4
   function filenameFromMeta(meta) {
     const raw = (meta || '').trim();
     const m = raw.match(/^(.*)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}):\d{2}-(\d{2}:\d{2}):\d{2}$/);
-    if (!m) return sanitizeFilename(raw || '课程录播') + '.mp4';
-    const prefix = m[1].trim().replace(/\s+/g,'_');
-    const date = m[2];
-    const t1 = m[3].replace(':','-');
-    const t2 = m[4].replace(':','-');
-    return sanitizeFilename(`${date}_${prefix}_${t1}-${t2}.mp4`);
+    if (!m) return sanitizeFilename(raw || '课程录播') + '.mp4'; // 不符合预期格式：直接把原文本当文件名兜底
+
+    const prefixRaw = m[1].trim(); // “课程 老师 教室” 这段（不同学校可能略有差异）
+    const parts = prefixRaw.split(/\s+/g).filter(Boolean); // 按空白切分：连续空格也算一个分隔
+
+    // 经验规则：常见的 title 是 “课程名 老师名 教室名”
+    // - 课程名通常在第 1 段
+    // - 老师名通常在第 2 段
+    // - 教室名在第 3 段（我们按你的要求不写）
+    const courseName = parts[0] || prefixRaw || '课程'; // 如果切分失败，就用整段 prefixRaw
+    const teacherName = parts[1] || '未知教师'; // 老师拿不到就兜底
+
+    const dateYmd = m[2]; // YYYY-MM-DD
+    const startHHmm = m[3]; // HH:mm
+    const endHHmm = m[4]; // HH:mm
+
+    return buildMp4FilenameV2({ // 统一走 v2 规则
+      dateYmd,
+      courseName,
+      teacherName,
+      startHHmm,
+      endHHmm
+    });
   }
 
   function parseDate(meta) {
@@ -172,13 +274,27 @@
 
   // 从 API 返回的 Value 对象构建文件名
   function buildFilenameFromApi(v) {
+    // 1) 老师：只取第一个老师（多数课程只有一个老师；多个老师也避免文件名过长）
     const teacher = (v.TeacherList && v.TeacherList[0] && v.TeacherList[0].Name) ? v.TeacherList[0].Name : '未知教师';
-    const date = (v.StartTime || '').slice(0, 10);
-    const st = (v.StartTime || '').slice(11, 16).replace(':', '-');
-    const et = (v.StopTime || '').slice(11, 16).replace(':', '-');
+
+    // 2) 日期：只要 YYYY-MM-DD，再转成 “M.D”
+    const dateYmd = (v.StartTime || '').slice(0, 10);
+
+    // 3) 时间：只要 HH:mm（分钟仅用于解析；最终文件名只保留小时）
+    const startHHmm = (v.StartTime || '').slice(11, 16);
+    const endHHmm = (v.StopTime || '').slice(11, 16);
+
+    // 4) 课程：先拿原始名，再走简写表
     const courseName = v.CourseName || '课程';
-    const classroom = v.ClassRoomName || '';
-    return sanitizeFilename(`${date}_${courseName}_${teacher}_${classroom}_${st}-${et}.mp4`);
+
+    // 5) 按你要求的新规则拼出文件名（不带教室信息）
+    return buildMp4FilenameV2({
+      dateYmd,
+      courseName,
+      teacherName: teacher,
+      startHHmm,
+      endHHmm
+    });
   }
 
   // 获取 csrkToken（从页面或cookie）
@@ -668,7 +784,8 @@
 
         let fn = buildFilenameFromApi(v);
         if (segments.length > 1) {
-          fn = fn.replace('.mp4', `_seg${i + 1}.mp4`);
+          // 多片段视频：在结尾追加 -segN，保证同一节课的多个片段不会互相覆盖
+          fn = fn.replace(/\.mp4$/i, `-seg${i + 1}.mp4`);
         }
 
         log('[API] 开始下载：', fn);
