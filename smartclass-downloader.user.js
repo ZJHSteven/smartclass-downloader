@@ -1,7 +1,7 @@
 // ==UserScript==
   // @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-  // @version      0.6
+  // @version      0.6.1
   // @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
   // @run-at      document-start
@@ -345,12 +345,12 @@
       border-radius: 12px;
       background: rgba(0, 0, 0, 0.18);
       border: 1px solid rgba(255, 255, 255, 0.10);
-      color: rgba(255, 255, 255, 0.90);
+      color: #ffffff; /* 关键：提示框文字用纯白，避免灰字看不清 */
       margin-bottom: 10px;
     }
-    #tm_panel .tm-help-title { font-weight: 900; margin-bottom: 6px; }
+    #tm_panel .tm-help-title { font-weight: 900; margin-bottom: 6px; color: #ffffff; }
     #tm_panel .tm-help ul { margin: 0; padding-left: 18px; }
-    #tm_panel .tm-help li { margin: 4px 0; }
+    #tm_panel .tm-help li { margin: 4px 0; color: #ffffff; }
     #tm_panel code { color: #d7e6ff; background: rgba(255, 255, 255, 0.08); padding: 1px 6px; border-radius: 8px; }
 
     #tm_panel details.tm-details summary {
@@ -394,7 +394,7 @@
       gap: 10px;
       margin-bottom: 8px;
     }
-    #tm_panel .tm-dl-name { opacity: 0.96; word-break: break-all; }
+    #tm_panel .tm-dl-name { color: #ffffff; opacity: 1; word-break: break-all; } /* 关键：下载状态标题用纯白 */
     #tm_panel .tm-dl-status { font-weight: 900; white-space: nowrap; }
     #tm_panel .tm-dl-status--done { color: #6dff7a; }
     #tm_panel .tm-dl-status--error { color: #ff6b6b; }
@@ -407,7 +407,7 @@
       margin: 6px 0 8px 0;
     }
     #tm_panel .tm-bar > div { height: 100%; }
-    #tm_panel .tm-dl-detail { opacity: 0.90; }
+    #tm_panel .tm-dl-detail { color: #ffffff; opacity: 1; } /* 关键：进度/速度详情用纯白 */
 
     #tm_panel .tm-list { display: flex; flex-direction: column; gap: 10px; }
     #tm_panel .tm-item {
