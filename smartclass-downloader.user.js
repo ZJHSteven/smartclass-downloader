@@ -1,7 +1,7 @@
 // ==UserScript==
   // @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-  // @version      0.6.2
+  // @version      0.6.3
   // @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
   // @run-at      document-start
@@ -258,8 +258,32 @@
     });
   }
 
+  /**
+   * 从 meta 文本里解析“日期”（用于：日期下拉筛选 / 最新日期判断）
+   *
+   * 【为什么要写得更鲁棒？】
+   * - 你反馈“最新日期明明是 12/13，却默认选了 12/11”：
+   *   常见原因是：有的条目日期格式不是 `YYYY-MM-DD`（可能是 `YYYY/MM/DD`、`YYYY.MM.DD`、甚至 `YYYY年MM月DD日`），
+   *   原来的正则只认 `YYYY-MM-DD`，导致那天的条目 date 解析失败，直接被当成“没有日期”，自然就进不了下拉/最新日期判断。
+   *
+   * @param {string} meta 例如：人体功能学 张玲 第二教室 2025-12-12 08:00:00-08:45:00
+   * @returns {string} 统一返回 `YYYY-MM-DD`；解析失败则返回空串
+   */
   function parseDate(meta) {
-    return (meta.match(/(\d{4}-\d{2}-\d{2})/) || [,''])[1];
+    const s = String(meta ?? ''); // 统一成字符串，避免 null/undefined 报错
+
+    // 小工具：把 1 位月份/日期补成 2 位（8 -> 08）
+    const pad2 = (n) => String(n).padStart(2, '0');
+
+    // 1) 常见格式：YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD（分隔符可能不同）
+    let m = s.match(/(\d{4})\s*[-\/.]\s*(\d{1,2})\s*[-\/.]\s*(\d{1,2})/);
+    if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`; // 统一成 ISO 方便排序
+
+    // 2) 中文格式：YYYY年MM月DD日
+    m = s.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+    if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`; // 同样统一
+
+    return ''; // 解析不了：就返回空，调用方再决定怎么处理
   }
 
   // 从 PlayFileUri 推导出 mp4 地址（带/不带 authKey 两个版本）
@@ -326,25 +350,76 @@
     return '';
   }
 
+  /**
+   * 等待 csrkToken 被“页面真实请求”捕获到。
+   *
+   * 场景：你如果一上来就点“批量下载”，但页面还没触发过任何带 token 的接口请求，
+   *       我们脚本就拿不到 token，API 会报“验证不通过”。
+   * 解决：这里做一个“短暂等待”（不会无限等），尽量等到 token 出现再发 API。
+   *
+   * @param {number} maxMs 最大等待毫秒数
+   * @returns {Promise<string>} 等到则返回 token，否则返回空串
+   */
+  async function waitForCsrkToken(maxMs) {
+    const start = Date.now(); // 记录起点时间
+    while (Date.now() - start < maxMs) { // 轮询直到超时
+      const t = getCsrkToken(); // 每次都走统一入口（内存/URL/cookie/localStorage）
+      if (t) return t; // 一旦有 token 立刻返回
+      await new Promise(r => setTimeout(r, 120)); // 小睡一会，避免死循环占用 CPU
+    }
+    return ''; // 超时：返回空串
+  }
+
   // 调用 API 获取视频信息
   async function getVideoInfoByNewId(newId) {
-    const csrkToken = getCsrkToken();
-    const url = new URL('/Video/GetVideoInfoDtoByID', location.origin);
-    url.searchParams.set('csrkToken', csrkToken);
-    url.searchParams.set('NewId', newId);
-    url.searchParams.set('isGetLink', 'true');
-    url.searchParams.set('VideoPwd', '');
-    url.searchParams.set('Answer', '');
-    url.searchParams.set('isloadstudent', 'true');
+    /**
+     * 内部小函数：真正发一次请求（为了下面“失败后重试”逻辑更清晰）
+     * @param {string} csrkToken 本次要用的 token（可能为空）
+     */
+    async function fetchOnce(csrkToken) {
+      const url = new URL('/Video/GetVideoInfoDtoByID', location.origin); // 构造接口 URL
+      url.searchParams.set('csrkToken', csrkToken); // token（为空也会带上，但通常会失败）
+      url.searchParams.set('NewId', newId); // 课程 NewId
+      url.searchParams.set('isGetLink', 'true'); // 站点常用参数：要求返回播放链接
+      url.searchParams.set('VideoPwd', ''); // 没有密码则空
+      url.searchParams.set('Answer', ''); // 没有答题则空
+      url.searchParams.set('isloadstudent', 'true'); // 站点常用参数
+
+      const resp = await fetch(url.toString(), { credentials: 'include' }); // 带 cookie
+      const json = await resp.json(); // 解析 JSON
+      if (!json?.Success) {
+        const msg = String(json?.Message || 'API返回失败'); // 把 Message 统一成字符串
+        const e = new Error(msg); // 用 Error 承载消息
+        e.__tm_apiMessage = msg; // 附加字段：方便上层判断是不是 token 问题
+        throw e; // 抛出，让上层处理（重试/降级）
+      }
+      return json.Value; // 成功：直接返回 Value
+    }
 
     try {
-      const resp = await fetch(url.toString(), { credentials: 'include' });
-      const json = await resp.json();
-      if (!json?.Success) {
-        throw new Error(json?.Message || 'API返回失败');
-      }
-      return json.Value;
+      // 1) 先拿一次 token（如果为空，短暂等一下）
+      let csrkToken = getCsrkToken();
+      if (!csrkToken) csrkToken = await waitForCsrkToken(2500); // 2.5 秒内有 token 就更稳
+
+      // 2) 第一次请求
+      return await fetchOnce(csrkToken);
     } catch (err) {
+      // 3) 常见失败：验证不通过（token 没抓到 / token 过期）
+      const msg = String(err?.__tm_apiMessage || err?.message || '');
+      if (msg.includes('验证不通过') || msg.toLowerCase().includes('token')) {
+        // 再等一会 token（有时候页面稍后才发带 token 的请求）
+        const csrkToken2 = await waitForCsrkToken(6000);
+        if (csrkToken2) {
+          try {
+            log('[API] 发现 token，重试一次：', newId);
+            return await fetchOnce(csrkToken2);
+          } catch (e2) {
+            log('[API错误-重试仍失败]', newId, e2.message);
+            throw e2;
+          }
+        }
+      }
+
       log('[API错误]', newId, err.message);
       throw err;
     }
@@ -738,7 +813,8 @@
   }
 
   function getLatestDate(items) {
-    const dates = uniq(items.map(x => x.date)).sort();
+    // 只保留“能解析出来的日期”，避免 '' 这种空值干扰“最新日期”判断
+    const dates = uniq(items.map(x => x.date).filter(Boolean)).sort();
     return dates[dates.length - 1] || '';
   }
 
@@ -770,7 +846,7 @@
       const segments = v.VideoSegmentInfo || [];
       if (!segments.length) {
         log('[API] 无视频片段：', item.newId);
-        return;
+        return { handoffToTab: false };
       }
 
       for (let i = 0; i < segments.length; i++) {
@@ -789,11 +865,18 @@
         }
 
         log('[API] 开始下载：', fn);
-        gmDownloadWithFallback(withKey, noKey, fn);
+        // 关键修复：必须 await，确保“并发控制/队列计数”是真正按下载完成来走的。
+        // 否则会出现：看起来“只下了两节课”，实际是第三节被浏览器/网络节流排队了，过几分钟才开始。
+        await gmDownloadWithFallback(withKey, noKey, fn);
       }
+
+      return { handoffToTab: false };
     } catch (err) {
       log('[API失败] 降级为后台页模式：', item.newId, err.message);
       openBackupTab(item);
+      // 重要：这类任务已经“交给后台页去做”了，队列处理器不要在本页提前 -inflight。
+      // 否则会导致 inflight 计数失真 → 并发失控 → 更容易被站点节流 → “下载不全/过几分钟才继续”。
+      return { handoffToTab: true };
     }
   }
 
@@ -832,11 +915,17 @@
 
     localStorage.setItem(inflightKey, String(inflight + 1));
 
+    // 默认：本页负责把 inflight -1（即：下载在本页完成）
+    // 但如果 API 失败改走“后台页下载”，就由后台页在完成/超时后 -1。
+    let shouldDecrementInThisTab = true;
     try {
-      await downloadByApi(next);
+      const r = await downloadByApi(next);
+      if (r && r.handoffToTab) shouldDecrementInThisTab = false;
     } finally {
-      const current = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
-      localStorage.setItem(inflightKey, String(current));
+      if (shouldDecrementInThisTab) {
+        const current = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
+        localStorage.setItem(inflightKey, String(current));
+      }
     }
   }
 
@@ -934,87 +1023,74 @@ function renderDlState() {
   }).join('');
 }
 
-// 带降级重试的下载函数（先试带参数，失败后试无参数）
-function gmDownloadWithFallback(urlWithKey, urlNoKey, filename) {
-  const now = Date.now();
-  __tmDlState.set(filename, {
-    filename,
-    status: 'downloading',
-    loaded: 0,
-    total: -1,
-    speed: 0,
-    t0: now,
-    lastT: now,
-    lastLoaded: 0,
-    err: ''
-  });
-  renderDlState();
-  log('开始下载(带参数)：', filename);
+/**
+ * 把 GM_download 包装成 Promise（关键修复：让“队列并发控制”真正按下载完成来计算）
+ *
+ * 你反馈的现象：
+ * - “同一天 3 节课只下了 2 节，中间莫名少一节”
+ * - “过 5 分钟又开始下”
+ *
+ * 常见根因就是：以前代码只是“发起下载”，并没有等下载真正结束就把队列并发放开了，导致：
+ * - 浏览器/站点节流把部分下载排队（你感觉像是“漏了”）
+ * - 过一段时间节流解除/队列空出来，又继续（你感觉像“过几分钟又开始了”）
+ *
+ * 这里我们统一把一次下载抽象成：Promise< {ok:boolean, err?:string} >
+ * 上层可以 await 它，队列就不会“提前放行”。
+ */
+function __tmStartGmDownload(url, filename) {
+  return new Promise((resolve) => {
+    try {
+      GM_download({
+        url,
+        name: filename,
+        saveAs: false,
+        timeout: 60000, // 1分钟无响应算超时（不影响正常大文件，只是让你能看到“卡住了”）
 
-  GM_download({
-    url: urlWithKey,
-    name: filename,
-    saveAs: false,
-    timeout: 60000,
+        onprogress: (e) => {
+          const st = __tmDlState.get(filename);
+          if (!st) return;
 
-    onprogress: (e) => {
-      const st = __tmDlState.get(filename);
-      if (!st) return;
+          const t = Date.now();
+          const loaded = (typeof e.loaded === 'number') ? e.loaded : st.loaded;
+          const total  = (typeof e.total === 'number') ? e.total : st.total;
 
-      const t = Date.now();
-      const loaded = (typeof e.loaded === 'number') ? e.loaded : st.loaded;
-      const total  = (typeof e.total === 'number') ? e.total : st.total;
+          // 粗略速度：最近一次回调的增量 / 时间
+          const dt = Math.max(1, t - st.lastT);
+          const dL = Math.max(0, loaded - st.lastLoaded);
+          const speed = Math.floor((dL * 1000) / dt);
 
-      const dt = Math.max(1, t - st.lastT);
-      const dL = Math.max(0, loaded - st.lastLoaded);
-      const speed = Math.floor((dL * 1000) / dt);
+          st.loaded = loaded;
+          st.total = total;
+          st.speed = speed;
+          st.lastT = t;
+          st.lastLoaded = loaded;
 
-      st.loaded = loaded;
-      st.total = total;
-      st.speed = speed;
-      st.lastT = t;
-      st.lastLoaded = loaded;
+          __tmDlState.set(filename, st);
 
-      __tmDlState.set(filename, st);
+          // 限流渲染，避免太频繁
+          if (!st.__lastRender || t - st.__lastRender > 300) {
+            st.__lastRender = t;
+            renderDlState();
+          }
+        },
 
-      if (!st.__lastRender || t - st.__lastRender > 300) {
-        st.__lastRender = t;
-        renderDlState();
-      }
-    },
+        onload: () => resolve({ ok: true }),
 
-    onload: () => {
-      const st = __tmDlState.get(filename);
-      if (st) {
-        st.status = 'done';
-        st.speed = 0;
-        __tmDlState.set(filename, st);
-      }
-      renderDlState();
-      log('下载完成：', filename);
-    },
+        onerror: (err) => {
+          const msg = (err && (err.error || err.message)) ? String(err.error || err.message) : '下载失败';
+          resolve({ ok: false, err: msg });
+        },
 
-    onerror: (err) => {
-      log('[降级] 带参数版本失败，尝试无参数版本：', filename);
-      // 降级到无参数版本
-      gmDownload(urlNoKey, filename);
-    },
-
-    ontimeout: () => {
-      const st = __tmDlState.get(filename);
-      if (st) {
-        st.status = 'error';
-        st.err = '下载超时（网络不稳定/被节流）';
-        __tmDlState.set(filename, st);
-      }
-      renderDlState();
-      log('下载超时：', filename);
-    },
+        ontimeout: () => resolve({ ok: false, err: '下载超时（网络不稳定/被节流）' }),
+      });
+    } catch (e) {
+      resolve({ ok: false, err: String(e?.message || e || 'GM_download异常') });
+    }
   });
 }
 
-// 原有的 gmDownload 函数（现在作为降级方案）
-function gmDownload(url, filename) {
+// 单次下载（不带降级）：返回 Promise，方便上层 await
+async function gmDownload(url, filename) {
   const now = Date.now();
   __tmDlState.set(filename, {
     filename,
@@ -1030,73 +1106,109 @@ function gmDownload(url, filename) {
   renderDlState();
   log('开始下载：', filename);
 
-  GM_download({
-    url,
-    name: filename,
-    saveAs: false,
-    timeout: 60000, // 1分钟无响应算超时（不影响正常大文件，只是让你能看到“卡住了”）
+  const r = await __tmStartGmDownload(url, filename);
 
-    onprogress: (e) => {
-      const st = __tmDlState.get(filename);
-      if (!st) return;
+  const st = __tmDlState.get(filename);
+  if (st) {
+    if (r.ok) {
+      st.status = 'done';
+      st.speed = 0;
+      st.err = '';
+    } else {
+      st.status = 'error';
+      st.err = r.err || '下载失败';
+    }
+    __tmDlState.set(filename, st);
+  }
+  renderDlState();
 
-      const t = Date.now();
-      const loaded = (typeof e.loaded === 'number') ? e.loaded : st.loaded;
-      const total  = (typeof e.total === 'number') ? e.total : st.total;
+  if (r.ok) log('下载完成：', filename);
+  else log('下载失败：', filename, r.err || '');
 
-      // 粗略速度：最近一次回调的增量 / 时间
-      const dt = Math.max(1, t - st.lastT);
-      const dL = Math.max(0, loaded - st.lastLoaded);
-      const speed = Math.floor((dL * 1000) / dt);
+  return r;
+}
 
-      st.loaded = loaded;
-      st.total = total;
-      st.speed = speed;
-      st.lastT = t;
-      st.lastLoaded = loaded;
-
-      __tmDlState.set(filename, st);
-
-      // 限流渲染，避免太频繁
-      if (!st.__lastRender || t - st.__lastRender > 300) {
-        st.__lastRender = t;
-        renderDlState();
-      }
-    },
-
-    onload: () => {
-      const st = __tmDlState.get(filename);
-      if (st) {
-        st.status = 'done';
-        st.speed = 0;
-        __tmDlState.set(filename, st);
-      }
-      renderDlState();
-      log('下载完成：', filename);
-    },
-
-    onerror: (err) => {
-      const st = __tmDlState.get(filename);
-      if (st) {
-        st.status = 'error';
-        st.err = (err && (err.error || err.message)) ? String(err.error || err.message) : '下载失败';
-        __tmDlState.set(filename, st);
-      }
-      renderDlState();
-      log('下载失败：', filename, JSON.stringify(err || {}));
-    },
-
-    ontimeout: () => {
-      const st = __tmDlState.get(filename);
-      if (st) {
-        st.status = 'error';
-        st.err = '下载超时（网络不稳定/被节流）';
-        __tmDlState.set(filename, st);
-      }
-      renderDlState();
-      log('下载超时：', filename);
-    },
+// 带降级重试的下载函数（先试带参数，失败后试无参数）：返回 Promise，方便上层 await
+async function gmDownloadWithFallback(urlWithKey, urlNoKey, filename) {
+  const now = Date.now();
+  __tmDlState.set(filename, {
+    filename,
+    status: 'downloading',
+    loaded: 0,
+    total: -1,
+    speed: 0,
+    t0: now,
+    lastT: now,
+    lastLoaded: 0,
+    err: ''
   });
+  renderDlState();
+  log('开始下载(带参数)：', filename);
+
+  const r1 = await __tmStartGmDownload(urlWithKey, filename);
+  if (r1.ok) {
+    const st = __tmDlState.get(filename);
+    if (st) {
+      st.status = 'done';
+      st.speed = 0;
+      st.err = '';
+      __tmDlState.set(filename, st);
+    }
+    renderDlState();
+    log('下载完成：', filename);
+    return r1;
+  }
+
+  // 第一次失败：尝试无参数版本
+  log('[降级] 带参数版本失败，尝试无参数版本：', filename, r1.err || '');
+
+  if (!urlNoKey) {
+    const st = __tmDlState.get(filename);
+    if (st) {
+      st.status = 'error';
+      st.err = r1.err || '带参数失败，且无无参数版本可用';
+      __tmDlState.set(filename, st);
+    }
+    renderDlState();
+    return { ok: false, err: r1.err || '下载失败' };
+  }
+
+  // 为第二次尝试重置一下计数（让 UI 看起来更直观）
+  const st2 = __tmDlState.get(filename);
+  if (st2) {
+    const t = Date.now();
+    st2.status = 'downloading';
+    st2.loaded = 0;
+    st2.total = -1;
+    st2.speed = 0;
+    st2.t0 = t;
+    st2.lastT = t;
+    st2.lastLoaded = 0;
+    st2.err = `降级中：${r1.err || '带参数失败'}`;
+    __tmDlState.set(filename, st2);
+  }
+  renderDlState();
+
+  const r2 = await __tmStartGmDownload(urlNoKey, filename);
+
+  const st = __tmDlState.get(filename);
+  if (st) {
+    if (r2.ok) {
+      st.status = 'done';
+      st.speed = 0;
+      st.err = '';
+    } else {
+      st.status = 'error';
+      st.err = r2.err || '下载失败';
+    }
+    __tmDlState.set(filename, st);
+  }
+  renderDlState();
+
+  if (r2.ok) log('下载完成：', filename);
+  else log('下载失败：', filename, r2.err || '');
+
+  return r2;
 }
 
 
@@ -1116,15 +1228,21 @@ function gmDownload(url, filename) {
       const mp4 = Array.from(mp4Set).find(u => u.includes('tmuvod.smartclass.cn') || u.includes('.mp4'));
       if (mp4) {
         log('准备下载：', mp4);
-        gmDownload(mp4, wantedName);
+        // 关键修复：必须等下载真正结束（成功/失败/超时）再释放 inflight，避免并发计数失真
+        const r = await gmDownload(mp4, wantedName);
 
         // inflight -1
         const inflightKey = 'tm_inflight';
         const inflight = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
         localStorage.setItem(inflightKey, String(inflight));
 
-        // 尝试自动关闭标签页（只对脚本打开的页通常有效；不行也无所谓）
-        setTimeout(() => { try { window.close(); } catch(e) {} }, 3000);
+        // 成功才自动关闭：失败时保留页面，方便你手动点播放/重试排查
+        if (r && r.ok) {
+          // 尝试自动关闭标签页（只对脚本打开的页通常有效；不行也无所谓）
+          setTimeout(() => { try { window.close(); } catch(e) {} }, 3000);
+        } else {
+          log('[自动下载] 本次下载失败，未自动关闭标签页：', wantedName);
+        }
         return;
       }
 
@@ -1142,6 +1260,11 @@ function gmDownload(url, filename) {
   runAutoDownloadIfNeeded();
 
   /******************* 渲染列表 + 按钮逻辑 *******************/
+  // 记住上一次“日期下拉”的选项集合：
+  // - 目的1：避免 updateUI 每 5 秒重建一次下拉，导致你手动选的日期被“悄悄改回最新日期”
+  // - 目的2：减少 DOM 抖动（下拉闪一下、点选体验差）
+  let __tmLastDatesKey = '';
+
   function updateUI() {
     const rec = parseRecommendList();
 
@@ -1149,10 +1272,27 @@ function gmDownload(url, filename) {
     info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'}`;
 
     // 日期下拉
-    const dates = uniq(rec.map(x => x.date)).sort();
+    // 下拉里只展示“有效日期”，避免出现空白选项误导你
+    const dates = uniq(rec.map(x => x.date).filter(Boolean)).sort();
     const sel = qs('#tm_date', panel);
-    sel.innerHTML = dates.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
-    if (dates.length) sel.value = getLatestDate(rec);
+    const prevValue = sel.value; // 记录“你当前手动选的是哪天”（修复：不会被定时刷新覆盖）
+    const datesKey = dates.join('|'); // 用 join 出一个简单 hash（足够用了）
+
+    // 只有日期集合变化时才重建 options（避免每次都把你选中的值冲掉）
+    if (datesKey !== __tmLastDatesKey) {
+      sel.innerHTML = dates.length
+        ? dates.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('')
+        : `<option value="">(无日期)</option>`;
+      __tmLastDatesKey = datesKey;
+    }
+
+    // 选中逻辑（优先级）：
+    // 1) 如果你之前选的日期还存在，就继续选它
+    // 2) 否则（比如列表变化了），自动选最新日期
+    if (dates.length) {
+      const keep = (prevValue && dates.includes(prevValue)) ? prevValue : '';
+      sel.value = keep || getLatestDate(rec);
+    }
 
     // 列表展示
     const list = qs('#tm_list', panel);
