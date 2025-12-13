@@ -305,12 +305,6 @@
 
   // 通过 API 直接下载（不再打开后台页）
   async function downloadByApi(item) {
-    const doneKey = `tm_done_${item.newId}_${item.filename}`;
-    if (localStorage.getItem(doneKey) === '1') {
-      log('[跳过] 已下载过：', item.filename);
-      return;
-    }
-
     try {
       log('[API] 获取视频信息：', item.newId);
       const v = await getVideoInfoByNewId(item.newId);
@@ -336,7 +330,7 @@
         }
 
         log('[API] 开始下载：', fn);
-        gmDownloadWithFallback(withKey, noKey, fn, doneKey);
+        gmDownloadWithFallback(withKey, noKey, fn);
       }
     } catch (err) {
       log('[API失败] 降级为后台页模式：', item.newId, err.message);
@@ -488,7 +482,7 @@ function renderDlState() {
 }
 
 // 带降级重试的下载函数（先试带参数，失败后试无参数）
-function gmDownloadWithFallback(urlWithKey, urlNoKey, filename, doneKey) {
+function gmDownloadWithFallback(urlWithKey, urlNoKey, filename) {
   const now = Date.now();
   __tmDlState.set(filename, {
     filename,
@@ -541,8 +535,6 @@ function gmDownloadWithFallback(urlWithKey, urlNoKey, filename, doneKey) {
       if (st) {
         st.status = 'done';
         st.speed = 0;
-          // ✅ 只有下载成功后才标记
-          if (doneKey) localStorage.setItem(doneKey, '1');
         __tmDlState.set(filename, st);
       }
       renderDlState();
@@ -552,7 +544,7 @@ function gmDownloadWithFallback(urlWithKey, urlNoKey, filename, doneKey) {
     onerror: (err) => {
       log('[降级] 带参数版本失败，尝试无参数版本：', filename);
       // 降级到无参数版本
-      gmDownload(urlNoKey, filename, doneKey);
+      gmDownload(urlNoKey, filename);
     },
 
     ontimeout: () => {
@@ -569,7 +561,7 @@ function gmDownloadWithFallback(urlWithKey, urlNoKey, filename, doneKey) {
 }
 
 // 原有的 gmDownload 函数（现在作为降级方案）
-function gmDownload(url, filename, doneKey) {
+function gmDownload(url, filename) {
   const now = Date.now();
   __tmDlState.set(filename, {
     filename,
@@ -613,8 +605,6 @@ function gmDownload(url, filename, doneKey) {
       __tmDlState.set(filename, st);
 
       // 限流渲染，避免太频繁
-        // ✅ 只有下载成功后才标记
-        if (doneKey) localStorage.setItem(doneKey, '1');
       if (!st.__lastRender || t - st.__lastRender > 300) {
         st.__lastRender = t;
         renderDlState();
@@ -663,17 +653,6 @@ function gmDownload(url, filename, doneKey) {
     const wantedName = sanitizeFilename(getParam('tm_fn') || '课程录播.mp4');
     const newId = getParam('tm_newid') || '';
 
-    // 防重复
-    const doneKey = `tm_done_${newId}_${wantedName}`;
-    if (localStorage.getItem(doneKey) === '1') {
-      log('已下载过，跳过：', wantedName);
-      // inflight -1
-      const inflightKey = 'tm_inflight';
-      const inflight = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
-      localStorage.setItem(inflightKey, String(inflight));
-      return;
-    }
-
     log('自动下载模式启动，目标文件名：', wantedName);
 
     // 等待 mp4 出现（最多 25 秒）
@@ -685,7 +664,6 @@ function gmDownload(url, filename, doneKey) {
       if (mp4) {
         log('准备下载：', mp4);
         gmDownload(mp4, wantedName);
-        localStorage.setItem(doneKey, '1');
 
         // inflight -1
         const inflightKey = 'tm_inflight';
