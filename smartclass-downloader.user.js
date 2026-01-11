@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.7.0
+// @version      0.7.1
 // @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
@@ -690,6 +690,20 @@
       list-style: none;
     }
     #tm_panel details.tm-details summary::-webkit-details-marker { display: none; }
+    #tm_panel .tm-log-mini {
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      background: rgba(0, 0, 0, 0.20);
+      color: rgba(245, 248, 255, 0.96);
+      margin-top: 10px;
+    }
+    #tm_panel .tm-log-line {
+      font-size: 12px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    #tm_panel .tm-log-empty { color: rgba(255, 255, 255, 0.72); }
     #tm_panel .tm-log {
       white-space: pre-wrap;
       word-break: break-word;
@@ -780,26 +794,77 @@
         </ul>
       </div>
 
-      <details class="tm-details" style="margin-bottom:10px;">
-        <summary>日志（点开看细节）</summary>
-        <pre id="tm_log" class="tm-log"></pre>
-      </details>
-
       <div id="tm_extra"></div>
       <div id="tm_list" class="tm-list"></div>
+
+      <div id="tm_log_mini" class="tm-log-mini"></div>
+      <details class="tm-details" style="margin-top:10px;">
+        <summary>日志（点开看全部）</summary>
+        <pre id="tm_log" class="tm-log"></pre>
+      </details>
     </div>
   `;
   document.documentElement.appendChild(panel);
   window.__tm_panel = panel; // 保存面板引用供其他功能使用
 
-  const logEl = qs('#tm_log', panel);
-  function log(...args) {
-    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-    console.log('[TM]', msg);
-    logEl.textContent += `[TM] ${msg}\n`;
-    logEl.scrollTop = logEl.scrollHeight;
+  const logEl = qs('#tm_log', panel);                                     // 完整日志的 DOM
+  const logMiniEl = qs('#tm_log_mini', panel);                            // 迷你日志的 DOM
+  const __tmLogLines = [];                                                // 日志行缓存（内存）
+  const __tmLogMax = 200;                                                 // 最多保留 200 行，防止过长
+  const __tmLogMiniCount = 3;                                             // 默认展示最近 3 条
+
+  /**
+   * 渲染“迷你日志”（只显示最近几条）。
+   */
+  function renderLogMini() {
+    if (!logMiniEl) return;                                               // 没有 DOM 就直接退出
+    if (__tmLogLines.length === 0) {                                      // 没日志时显示占位
+      logMiniEl.innerHTML = `<div class="tm-log-line tm-log-empty">暂无日志</div>`; // 占位提示
+      return;                                                             // 结束
+    }
+    const tail = __tmLogLines.slice(-__tmLogMiniCount);                   // 取最近 N 条
+    logMiniEl.innerHTML = tail.map(l =>                                   // 逐条渲染
+      `<div class="tm-log-line">${escapeHtml(l)}</div>`                   // 每条单独一行
+    ).join('');                                                           // 合并 HTML
   }
-  qs('#tm_clear', panel).addEventListener('click', () => logEl.textContent = '');
+
+  /**
+   * 追加一条日志到缓存与 UI。
+   * @param {string} line 日志文本（已经拼好）
+   */
+  function appendLogLine(line) {
+    __tmLogLines.push(line);                                              // 写入缓存
+    if (__tmLogLines.length > __tmLogMax) {                               // 超过上限则丢弃最旧
+      __tmLogLines.shift();                                               // 移除第一条
+    }
+    logEl.textContent = __tmLogLines.join('\n') + '\n';                   // 重新渲染完整日志
+    logEl.scrollTop = logEl.scrollHeight;                                 // 滚动到底部
+    renderLogMini();                                                      // 同步更新迷你日志
+  }
+
+  /**
+   * 清空日志（完整 + 迷你）。
+   */
+  function clearLogs() {
+    __tmLogLines.length = 0;                                              // 清空缓存
+    logEl.textContent = '';                                               // 清空完整日志
+    renderLogMini();                                                      // 刷新迷你日志
+  }
+
+  /**
+   * 统一日志入口：控制台 + 面板日志。
+   * @param {...any} args 日志参数
+   */
+  function log(...args) {
+    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '); // 拼接日志文本
+    const ts = new Date().toLocaleTimeString();                           // 加上时间戳，方便定位
+    const line = `[TM ${ts}] ${msg}`;                                     // 形成一条完整日志
+    console.log('[TM]', msg);                                             // 控制台输出（保留原样）
+    appendLogLine(line);                                                  // 写入面板日志
+  }
+
+  renderLogMini();                                                        // 初始化迷你日志
+  qs('#tm_clear', panel).addEventListener('click', () => clearLogs());     // 清空按钮
 
   // 面板折叠/展开：给屏幕留空间（把状态存到 localStorage，刷新后还能记住）
   (function initPanelCollapse(){
