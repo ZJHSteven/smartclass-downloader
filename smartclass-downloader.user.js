@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.7.1
+// @version      0.7.2
 // @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
@@ -165,6 +165,15 @@
     defaultSavePath: '',                   // 默认保存目录（空串表示用 Gopeed 默认目录）
     includeRefererHeader: true,            // 是否附带 Referer（部分站点需要）
     includeCookieHeader: false             // 是否附带 Cookie（如需鉴权可改 true）
+  };
+
+  /**
+   * UI 行为配置（默认值偏保守，避免自动展开打扰）
+   */
+  const UI_CONFIG = {
+    autoOpenLatest: false,                 // 是否自动展开“最新日期”（默认否）
+    refreshMs: 5000,                       // UI 刷新间隔（毫秒）
+    miniLogLines: 2                        // 迷你日志默认展示行数
   };
 
   /**
@@ -693,25 +702,28 @@
     #tm_panel .tm-log-mini {
       padding: 8px 10px;
       border-radius: 12px;
-      border: 1px solid rgba(255, 255, 255, 0.10);
-      background: rgba(0, 0, 0, 0.20);
-      color: rgba(245, 248, 255, 0.96);
+      border: 1px solid rgba(255, 255, 255, 0.20);
+      background: rgba(255, 255, 255, 0.10);
+      color: #ffffff;
       margin-top: 10px;
+      max-height: 44px; /* 固定高度，避免挤占列表空间 */
+      overflow: hidden;
     }
     #tm_panel .tm-log-line {
       font-size: 12px;
       line-height: 1.45;
       word-break: break-word;
+      color: #ffffff;
     }
-    #tm_panel .tm-log-empty { color: rgba(255, 255, 255, 0.72); }
+    #tm_panel .tm-log-empty { color: rgba(255, 255, 255, 0.85); }
     #tm_panel .tm-log {
       white-space: pre-wrap;
       word-break: break-word;
-      background: rgba(0, 0, 0, 0.24);
+      background: rgba(255, 255, 255, 0.10);
       padding: 10px;
       border-radius: 12px;
-      border: 1px solid rgba(255, 255, 255, 0.10);
-      color: rgba(245, 248, 255, 0.96);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: #ffffff;
       margin: 0;
     }
 
@@ -794,14 +806,14 @@
         </ul>
       </div>
 
-      <div id="tm_extra"></div>
-      <div id="tm_list" class="tm-list"></div>
-
       <div id="tm_log_mini" class="tm-log-mini"></div>
       <details class="tm-details" style="margin-top:10px;">
         <summary>日志（点开看全部）</summary>
         <pre id="tm_log" class="tm-log"></pre>
       </details>
+
+      <div id="tm_extra"></div>
+      <div id="tm_list" class="tm-list"></div>
     </div>
   `;
   document.documentElement.appendChild(panel);
@@ -811,7 +823,7 @@
   const logMiniEl = qs('#tm_log_mini', panel);                            // 迷你日志的 DOM
   const __tmLogLines = [];                                                // 日志行缓存（内存）
   const __tmLogMax = 200;                                                 // 最多保留 200 行，防止过长
-  const __tmLogMiniCount = 3;                                             // 默认展示最近 3 条
+  const __tmLogMiniCount = UI_CONFIG.miniLogLines;                        // 默认展示最近 N 条
 
   /**
    * 渲染“迷你日志”（只显示最近几条）。
@@ -1158,12 +1170,14 @@
       if (d) openSet.add(d);                                              // 有日期才记录展开状态
     });
 
-    const latestDate = getLatestDate(rec);                                // 最新日期（默认展开）
+    const latestDate = getLatestDate(rec);                                // 最新日期（用于自动展开）
     const dates = Object.keys(__tmItemsByDate).sort((a, b) => b.localeCompare(a)); // 日期倒序
 
     list.innerHTML = dates.map(d => {                                     // 逐日渲染
       const items = __tmItemsByDate[d] || [];                             // 该日期的课程
-      const shouldOpen = openSet.size ? openSet.has(d) : d === latestDate; // 保留展开状态
+      const shouldOpen = openSet.size                                     // 是否已有展开记录
+        ? openSet.has(d)                                                  // 有记录就按记录决定
+        : (UI_CONFIG.autoOpenLatest ? d === latestDate : false);          // 否则按配置决定是否自动展开
       const openAttr = shouldOpen ? 'open' : '';                          // open 属性
 
       const itemsHtml = items.map(it => `                               // 构建单日条目 HTML
@@ -1200,7 +1214,7 @@
   }
 
   setTimeout(updateUI, 1200);                                             // 延迟首次刷新（等 DOM 稳定）
-  setInterval(updateUI, 5000);                                            // 定时刷新列表
+  setInterval(updateUI, UI_CONFIG.refreshMs);                             // 定时刷新列表（可配置）
 
   // 列表事件：统一用事件委托，避免频繁绑定
   qs('#tm_list', panel).addEventListener('click', (ev) => {
