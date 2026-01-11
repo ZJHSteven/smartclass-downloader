@@ -1,12 +1,12 @@
 // ==UserScript==
-  // @name         智慧课堂：批量抓MP4 + 自动命名下载（队列版）
+// @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-  // @version      0.6.3
-  // @description  通过API直接获取视频信息，秒级生成下载任务。支持队列批量下载，带降级方案。
+// @version      0.7.0
+// @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
-  // @run-at      document-start
-  // @grant        GM_download
-  // @grant        GM_openInTab
+// @run-at      document-start
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
 // ==/UserScript==
 
 (function () {
@@ -141,6 +141,160 @@
 
   function uniq(arr) {
     return Array.from(new Set(arr.filter(Boolean)));
+  }
+
+  /******************* Gopeed 外部下载器配置（替代 GM_download） *******************/
+  /**
+   * 你给的 curl 示例使用了：
+   * - API 基址：http://127.0.0.1:9999
+   * - token 头：x-api-token: Mm520520
+   *
+   * 注意：Gopeed 文档里同时出现过 /request、/api/tasks/batch、/api/server/info 等不同路径，
+   * 你的 Gopeed 版本如果是 /api/v1/*，可以直接改下面的路径。
+   * 这里把“路径”做成可配置，避免每次改逻辑。
+   */
+  const GOPEED_CONFIG = {
+    baseUrl: 'http://127.0.0.1:9999',      // Gopeed API 基址（建议 127.0.0.1，避免 localhost 解析问题）
+    apiToken: 'Mm520520',                  // Gopeed API Token（你设置的令牌）
+    tokenHeader: 'x-api-token',            // Token 头名称（你给的示例是 x-api-token）
+    createMode: 'tasks',                   // 创建任务模式：tasks | batch | request
+    tasksPath: '/api/v1/tasks',            // 单任务创建路径（若你的 Gopeed 用 /api，可改成 /api/tasks）
+    batchPath: '/api/v1/tasks/batch',      // 批量创建路径（若你的 Gopeed 用 /api，可改成 /api/tasks/batch）
+    requestPath: '/api/v1/request',        // 简版请求路径（若你的 Gopeed 用 /request，可改成 /request）
+    timeoutMs: 15000,                      // API 超时（毫秒）
+    defaultSavePath: '',                   // 默认保存目录（空串表示用 Gopeed 默认目录）
+    includeRefererHeader: true,            // 是否附带 Referer（部分站点需要）
+    includeCookieHeader: false             // 是否附带 Cookie（如需鉴权可改 true）
+  };
+
+  /**
+   * 统一拼接 baseUrl + path，避免出现双斜杠或漏斜杠。
+   * @param {string} base 基址（如 http://127.0.0.1:9999）
+   * @param {string} path 路径（如 /api/tasks）
+   * @returns {string} 拼好的完整 URL
+   */
+  function joinUrl(base, path) {
+    const b = String(base || '').replace(/\/+$/g, ''); // 去掉 base 末尾多余斜杠
+    const p = String(path || '').replace(/^\/+/g, ''); // 去掉 path 开头多余斜杠
+    return `${b}/${p}`;                                // 统一用单斜杠连接
+  }
+
+  /**
+   * 构造 Gopeed API 请求头。
+   * @returns {Record<string, string>} 请求头对象
+   */
+  function buildGopeedHeaders() {
+    const headers = {};                                                   // 先准备空对象
+    headers['accept'] = 'application/json';                               // 告诉服务端期望 JSON
+    headers['content-type'] = 'application/json';                         // 请求体是 JSON
+    if (GOPEED_CONFIG.apiToken) {                                         // 有 token 才附带
+      headers[GOPEED_CONFIG.tokenHeader] = GOPEED_CONFIG.apiToken;        // 使用你给的 token 头
+    }
+    return headers;                                                       // 返回完整头对象
+  }
+
+  /**
+   * 构造“下载请求”需要的 HTTP 头（给 Gopeed 代请求时用）。
+   * @returns {Record<string, string>} 请求头对象
+   */
+  function buildGopeedDownloadHeaders() {
+    const headers = {};                                                   // 初始化空对象
+    if (GOPEED_CONFIG.includeRefererHeader) {                             // 需要 Referer 才加
+      headers['Referer'] = location.href;                                 // 保持与浏览器访问一致
+    }
+    if (GOPEED_CONFIG.includeCookieHeader && document.cookie) {           // 需要 Cookie 才加
+      headers['Cookie'] = document.cookie;                                // 透传当前页面 Cookie
+    }
+    return headers;                                                       // 返回结果
+  }
+
+  /**
+   * 使用 GM_xmlhttpRequest 发送 JSON 请求（避免 CORS）。
+   * @param {string} method HTTP 方法（GET/POST 等）
+   * @param {string} url 完整 URL
+   * @param {object|null} bodyObj JSON 对象（GET 时可传 null）
+   * @param {number} timeoutMs 超时毫秒数
+   * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
+   */
+  function gmRequestJson(method, url, bodyObj, timeoutMs) {
+    return new Promise((resolve) => {                                     // 用 Promise 包一层方便 await
+      const bodyText = bodyObj ? JSON.stringify(bodyObj) : '';            // POST 才需要 body
+      GM_xmlhttpRequest({                                                 // 调用 Tampermonkey 的跨域请求
+        method: method,                                                   // 设置方法
+        url: url,                                                         // 设置 URL
+        headers: buildGopeedHeaders(),                                    // 设置 Gopeed API 头
+        data: bodyText,                                                   // 写入请求体
+        timeout: timeoutMs,                                               // 设置超时
+        onload: (resp) => {                                               // 成功返回
+          const status = Number(resp.status || 0);                        // 统一成数字状态码
+          const text = String(resp.responseText || '');                   // 统一成文本
+          let data = null;                                                // 先准备解析结果
+          try { data = text ? JSON.parse(text) : null; } catch (e) {}     // 尝试解析 JSON
+          resolve({ ok: status >= 200 && status < 300, status, data, text }); // 返回结构化结果
+        },
+        onerror: () => {                                                  // 网络错误
+          resolve({ ok: false, status: 0, data: null, text: '网络错误' }); // 统一成失败结构
+        },
+        ontimeout: () => {                                                // 超时
+          resolve({ ok: false, status: 0, data: null, text: '请求超时' }); // 统一成失败结构
+        }
+      });
+    });
+  }
+
+  /**
+   * 构造 Gopeed “创建任务”请求体。
+   * @param {string} url 下载地址
+   * @param {string} filename 期望的文件名
+   * @returns {{req: object, opt?: object}} 任务创建结构
+   */
+  function buildGopeedCreateTaskBody(url, filename) {
+    const req = {                                                        // Gopeed 的 Request 结构
+      url: url                                                          // 必填：下载地址
+    };
+    const extraHeaders = buildGopeedDownloadHeaders();                   // 可选的额外请求头
+    if (Object.keys(extraHeaders).length > 0) {                          // 只有真的有头才塞进去
+      req.extra = { header: extraHeaders };                              // HttpReqExtra：header
+    }
+
+    const opt = {};                                                      // Options：下载选项
+    if (filename) {                                                      // 有文件名才设置
+      opt.name = filename;                                               // 自定义文件名
+    }
+    if (GOPEED_CONFIG.defaultSavePath) {                                 // 有默认目录才设置
+      opt.path = GOPEED_CONFIG.defaultSavePath;                          // 自定义保存路径
+    }
+
+    const body = { req };                                                // 先放 req
+    if (Object.keys(opt).length > 0) body.opt = opt;                      // 只有有字段才挂 opt
+    return body;                                                         // 返回最终 body
+  }
+
+  /**
+   * 把一个下载任务提交给 Gopeed（按配置的 createMode 走）。
+   * @param {string} url 下载地址
+   * @param {string} filename 自定义文件名
+   * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
+   */
+  async function submitGopeedTask(url, filename) {
+    const body = buildGopeedCreateTaskBody(url, filename);               // 生成任务 body（req + opt）
+
+    if (GOPEED_CONFIG.createMode === 'tasks') {                          // 模式：单任务 /api/tasks
+      const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.tasksPath); // 拼接 URL
+      return await gmRequestJson('POST', endpoint, body, GOPEED_CONFIG.timeoutMs); // 直接提交
+    }
+
+    if (GOPEED_CONFIG.createMode === 'batch') {                          // 模式：批量 /api/tasks/batch
+      const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.batchPath); // 拼接 URL
+      const batchBody = { reqs: [body.req] };                             // 只放一个请求，也合法
+      if (body.opt) batchBody.opt = body.opt;                             // 有 opt 才挂上
+      return await gmRequestJson('POST', endpoint, batchBody, GOPEED_CONFIG.timeoutMs); // 提交
+    }
+
+    // 兜底模式：/request（官方文档明确有此端点，但不保证支持 name/path）
+    const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.requestPath); // 拼接 URL
+    const requestBody = { url: url, labels: { filename: filename || '' } };     // 只提交 url + 标签
+    return await gmRequestJson('POST', endpoint, requestBody, GOPEED_CONFIG.timeoutMs); // 提交
   }
 
   /******************* 文件命名（新规则 v2） *******************/
@@ -286,14 +440,24 @@
     return ''; // 解析不了：就返回空，调用方再决定怎么处理
   }
 
-  // 从 PlayFileUri 推导出 mp4 地址（带/不带 authKey 两个版本）
+  // 从 PlayFileUri 推导出 mp4 地址（我们优先使用“无参数”的纯净版本）
   function mp4FromPlayUri(playUri) {
-    if (!playUri) return { withKey: '', noKey: '' };
-    // content.html 替换为 VGA.mp4，保留 query 参数（timestamp/authKey）
-    const withKey = playUri.replace(/content\.html(\?.*)?$/i, 'VGA.mp4$1');
-    // 不带参数的纯净版本
-    const noKey = withKey.split('?')[0];
-    return { withKey, noKey };
+    if (!playUri) return { withKey: '', noKey: '' };                 // 入参为空直接返回
+    // content.html 替换为 VGA.mp4，保留 query 参数（timestamp/authKey 等）
+    const withKey = playUri.replace(/content\.html(\?.*)?$/i, 'VGA.mp4$1'); // 带参数版本
+    // 不带参数的纯净版本（去掉 ? 后面的所有参数）
+    const noKey = withKey.split('?')[0];                             // 无参数版本
+    return { withKey, noKey };                                       // 返回两个版本
+  }
+
+  /**
+   * 根据你的需求：优先“无参数”版本，避免 authKey 过期。
+   * @param {string} playUri 播放地址
+   * @returns {string} 无参数 mp4（拿不到则返回空串）
+   */
+  function pickMp4Url(playUri) {
+    const r = mp4FromPlayUri(playUri);                               // 先解析两种版本
+    return r.noKey || '';                                            // 只返回无参数版本
   }
 
   // 从 API 返回的 Value 对象构建文件名
@@ -391,7 +555,7 @@
         const msg = String(json?.Message || 'API返回失败'); // 把 Message 统一成字符串
         const e = new Error(msg); // 用 Error 承载消息
         e.__tm_apiMessage = msg; // 附加字段：方便上层判断是不是 token 问题
-        throw e; // 抛出，让上层处理（重试/降级）
+        throw e; // 抛出，让上层处理（重试/记录）
       }
       return json.Value; // 成功：直接返回 Value
     }
@@ -484,33 +648,6 @@
       margin-bottom: 10px;
     }
 
-    #tm_panel .tm-row {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-    #tm_panel .tm-label {
-      color: rgba(255, 255, 255, 0.92);
-      font-weight: 800;
-    }
-
-    #tm_panel .tm-select {
-      flex: 1;
-      min-width: 140px;
-      padding: 7px 10px;
-      border-radius: 10px;
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      background: rgba(0, 0, 0, 0.18);
-      color: #ffffff;
-      outline: none;
-    }
-    #tm_panel .tm-select:focus {
-      border-color: rgba(79, 140, 255, 0.70);
-      box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.18);
-    }
-
     #tm_panel .tm-btn {
       appearance: none;
       border: 1px solid rgba(255, 255, 255, 0.18);
@@ -566,47 +703,53 @@
 
     #tm_panel #tm_extra { margin: 10px 0; }
 
-    #tm_panel #tm_dl_box {
-      padding: 10px;
-      border-radius: 12px;
+    #tm_panel .tm-list { display: flex; flex-direction: column; gap: 10px; }
+    #tm_panel details.tm-day summary {
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    #tm_panel details.tm-day summary::-webkit-details-marker { display: none; }
+    #tm_panel .tm-day {
       border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      padding: 8px 10px;
       background: rgba(255, 255, 255, 0.06);
     }
-    #tm_panel .tm-dl-title { font-weight: 900; margin-bottom: 8px; }
-    #tm_panel .tm-dl-item {
-      border: 1px solid rgba(255, 255, 255, 0.10);
-      border-radius: 12px;
-      padding: 10px;
-      background: rgba(0, 0, 0, 0.12);
-    }
-    #tm_panel .tm-dl-top {
+    #tm_panel .tm-day-summary {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       gap: 10px;
-      margin-bottom: 8px;
     }
-    #tm_panel .tm-dl-name { color: #ffffff; opacity: 1; word-break: break-all; } /* 关键：下载状态标题用纯白 */
-    #tm_panel .tm-dl-status { font-weight: 900; white-space: nowrap; }
-    #tm_panel .tm-dl-status--done { color: #6dff7a; }
-    #tm_panel .tm-dl-status--error { color: #ff6b6b; }
-    #tm_panel .tm-dl-status--downloading { color: #8ab4ff; }
-    #tm_panel .tm-bar {
-      height: 8px;
-      background: rgba(255, 255, 255, 0.12);
-      border-radius: 999px;
-      overflow: hidden;
-      margin: 6px 0 8px 0;
+    #tm_panel .tm-day-title {
+      font-weight: 900;
+      color: #ffffff;
     }
-    #tm_panel .tm-bar > div { height: 100%; }
-    #tm_panel .tm-dl-detail { color: #ffffff; opacity: 1; } /* 关键：进度/速度详情用纯白 */
-
-    #tm_panel .tm-list { display: flex; flex-direction: column; gap: 10px; }
+    #tm_panel .tm-day-sub {
+      color: rgba(255, 255, 255, 0.78);
+      font-size: 12px;
+    }
+    #tm_panel .tm-day-actions { display: flex; gap: 8px; }
+    #tm_panel .tm-day-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
     #tm_panel .tm-item {
       border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 12px;
       padding: 10px;
       background: rgba(255, 255, 255, 0.06);
     }
+    #tm_panel .tm-item-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    #tm_panel .tm-item-actions { display: flex; gap: 8px; }
     #tm_panel .tm-item-meta { font-weight: 900; color: #ffffff; margin-bottom: 6px; }
     #tm_panel .tm-item-sub { color: rgba(255, 255, 255, 0.90); margin-top: 4px; }
     #tm_panel .tm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
@@ -628,19 +771,12 @@
     <div id="tm_body" class="tm-body">
       <div id="tm_info" class="tm-info"></div>
 
-      <div class="tm-row">
-        <span class="tm-label">选择日期</span>
-        <select id="tm_date" class="tm-select"></select>
-        <button id="tm_dl_date" class="tm-btn primary" type="button">下载该日期（队列）</button>
-        <button id="tm_dl_latest" class="tm-btn" type="button">下载最新日期（队列）</button>
-        <button id="tm_dl_this" class="tm-btn" type="button">下载本页</button>
-      </div>
-
       <div class="tm-help">
         <div class="tm-help-title">使用提示</div>
         <ul>
-          <li>脚本会从页面网络请求里捕获并缓存 <code>csrkToken</code>，解决“验证不通过”。</li>
-          <li>若“本页下载”提示没抓到 MP4，请先点一下播放触发取源请求。</li>
+          <li>已改为 <code>Gopeed</code> 外部下载器提交任务（不再使用浏览器下载）。</li>
+          <li>请确认 Gopeed 已开启 TCP API，并配置了 Token（示例：<code>x-api-token</code>）。</li>
+          <li>列表按日期倒序展示，可下载“整天”或“单节”。</li>
         </ul>
       </div>
 
@@ -783,567 +919,256 @@
 
   /******************* 解析“相关推荐” *******************/
   function parseRecommendList() {
-    const ul = qs('ul.about_video');
-    if (!ul) return [];
+    const ul = qs('ul.about_video');                                     // 推荐列表容器
+    if (!ul) return [];                                                  // 没找到直接返回空数组
 
-    const items = [];
-    qsa('li a[href*="Video.aspx?NewID="]', ul).forEach(a => {
-      const href = a.getAttribute('href') || '';
-      const full = new URL(href, location.origin).toString();
-      const u = new URL(full);
-      const newId = u.searchParams.get('NewID') || '';
+    const items = [];                                                    // 用于收集结果
+    qsa('li a[href*="Video.aspx?NewID="]', ul).forEach(a => {            // 遍历每个推荐项
+      const href = a.getAttribute('href') || '';                         // 取出 href
+      const full = new URL(href, location.origin).toString();            // 补成绝对地址
+      const u = new URL(full);                                           // 解析 URL
+      const newId = u.searchParams.get('NewID') || '';                   // 取出 NewID
 
-      const titleP = qs('p.title', a);
-      const meta = (titleP?.getAttribute('title') || '').trim();
+      const titleP = qs('p.title', a);                                   // 标题节点
+      const meta = (titleP?.getAttribute('title') || '').trim();         // meta 文本
 
-      if (newId) {
-        items.push({
-          newId,
-          url: full,
-          meta,
-          date: parseDate(meta),
-          filename: filenameFromMeta(meta || `NewID_${newId}`)
+      if (newId) {                                                       // 只有有 NewID 才收录
+        items.push({                                                     // 记录一条
+          newId,                                                         // NewID
+          url: full,                                                     // 详情页 URL
+          meta,                                                          // meta 原始文本
+          date: parseDate(meta),                                         // 解析出的日期
+          filename: filenameFromMeta(meta || `NewID_${newId}`)           // 生成文件名
         });
       }
     });
 
-    // 日期+时间排序（更像课表顺序）
-    items.sort((x,y) => (x.meta || '').localeCompare(y.meta || ''));
-    return items;
+    sortItemsForDisplay(items);                                          // 按日期倒序 + 时间排序
+    return items;                                                        // 返回结果
   }
 
+  /**
+   * 列表排序：日期倒序（新日期在前），同一天按 meta 正序（接近上课顺序）。
+   * @param {Array<{date:string,meta:string}>} items 课程列表
+   */
+  function sortItemsForDisplay(items) {
+    items.sort((a, b) => {                                                // 自定义排序
+      const da = a.date || '';                                            // A 的日期
+      const db = b.date || '';                                            // B 的日期
+      if (da !== db) return db.localeCompare(da);                         // 日期倒序
+      return (a.meta || '').localeCompare(b.meta || '');                  // 同日按 meta
+    });
+  }
+
+  /**
+   * 获取“最新日期”（用于默认展开）。
+   * @param {Array<{date:string}>} items 课程列表
+   * @returns {string} 最新日期（YYYY-MM-DD）
+   */
   function getLatestDate(items) {
-    // 只保留“能解析出来的日期”，避免 '' 这种空值干扰“最新日期”判断
-    const dates = uniq(items.map(x => x.date).filter(Boolean)).sort();
-    return dates[dates.length - 1] || '';
+    const dates = uniq(items.map(x => x.date).filter(Boolean)).sort();    // 排序后的日期列表
+    return dates[dates.length - 1] || '';                                 // 取最后一个就是最新
   }
 
-  /******************* 队列：后台打开 → 每页自动下载 *******************/
-  const queueKey = 'tm_queue_v1';
-
-  function loadQueue() {
-    try { return JSON.parse(localStorage.getItem(queueKey) || '[]'); } catch(e) { return []; }
-  }
-  function saveQueue(q) {
-    localStorage.setItem(queueKey, JSON.stringify(q));
-  }
-
-  function enqueue(items) {
-    const q = loadQueue();
-    // 去重：按 newId
-    const have = new Set(q.map(x => x.newId));
-    for (const it of items) if (!have.has(it.newId)) q.push(it);
-    saveQueue(q);
-    log(`队列加入 ${items.length} 条，当前队列总数=${q.length}`);
+  /**
+   * 按日期分组，方便 UI 分组展示。
+   * @param {Array<{date:string}>} items 课程列表
+   * @returns {Record<string, Array>} 日期 -> 条目数组
+   */
+  function groupItemsByDate(items) {
+    const map = {};                                                       // 用对象做分组
+    for (const it of items) {                                             // 遍历每条
+      const d = it.date || '未知日期';                                    // 日期为空时兜底
+      if (!map[d]) map[d] = [];                                           // 初始化分组
+      map[d].push(it);                                                    // 塞入分组
+    }
+    return map;                                                           // 返回分组结果
   }
 
-  // 通过 API 直接下载（不再打开后台页）
+  /**
+   * 通过 API 获取 mp4，再把任务提交给 Gopeed。
+   * @param {object} item 单条课程信息
+   */
   async function downloadByApi(item) {
     try {
-      log('[API] 获取视频信息：', item.newId);
-      const v = await getVideoInfoByNewId(item.newId);
-      
-      const segments = v.VideoSegmentInfo || [];
-      if (!segments.length) {
-        log('[API] 无视频片段：', item.newId);
-        return { handoffToTab: false };
+      log('[API] 获取视频信息：', item.newId);                            // 日志：开始请求
+      const v = await getVideoInfoByNewId(item.newId);                    // 调 API 拿信息
+
+      const segments = v.VideoSegmentInfo || [];                          // 课程片段列表
+      if (!segments.length) {                                             // 没有片段直接返回
+        log('[API] 无视频片段：', item.newId);                            // 日志提示
+        return;                                                           // 结束
       }
 
-      for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i];
-        const { withKey, noKey } = mp4FromPlayUri(seg.PlayFileUri);
-        
-        if (!withKey) {
-          log('[API] 无法解析 mp4 地址：', seg.PlayFileUri);
-          continue;
+      for (let i = 0; i < segments.length; i++) {                         // 逐片段处理
+        const seg = segments[i];                                          // 当前片段
+        const mp4Url = pickMp4Url(seg.PlayFileUri);                       // 只取无参数 mp4
+
+        if (!mp4Url) {                                                    // 取不到就跳过
+          log('[API] 无法解析无参数 mp4 地址：', seg.PlayFileUri);         // 日志提示
+          continue;                                                       // 进入下一个片段
         }
 
-        let fn = buildFilenameFromApi(v);
-        if (segments.length > 1) {
-          // 多片段视频：在结尾追加 -segN，保证同一节课的多个片段不会互相覆盖
-          fn = fn.replace(/\.mp4$/i, `-seg${i + 1}.mp4`);
+        let fn = buildFilenameFromApi(v);                                 // 基础文件名
+        if (segments.length > 1) {                                        // 多片段需要区分
+          fn = fn.replace(/\.mp4$/i, `-seg${i + 1}.mp4`);                  // 追加分段后缀
         }
 
-        log('[API] 开始下载：', fn);
-        // 关键修复：必须 await，确保“并发控制/队列计数”是真正按下载完成来走的。
-        // 否则会出现：看起来“只下了两节课”，实际是第三节被浏览器/网络节流排队了，过几分钟才开始。
-        await gmDownloadWithFallback(withKey, noKey, fn);
+        log('[Gopeed] 提交下载：', fn);                                    // 日志提示
+        const r = await submitGopeedTask(mp4Url, fn);                     // 提交到 Gopeed
+        if (!r.ok) {                                                      // 提交失败
+          log('[Gopeed] 提交失败：', fn, r.status || '', r.text || '');    // 输出失败原因
+        } else {                                                          // 提交成功
+          log('[Gopeed] 已提交：', fn);                                    // 成功日志
+        }
       }
-
-      return { handoffToTab: false };
     } catch (err) {
-      log('[API失败] 降级为后台页模式：', item.newId, err.message);
-      openBackupTab(item);
-      // 重要：这类任务已经“交给后台页去做”了，队列处理器不要在本页提前 -inflight。
-      // 否则会导致 inflight 计数失真 → 并发失控 → 更容易被站点节流 → “下载不全/过几分钟才继续”。
-      return { handoffToTab: true };
+      log('[API失败] 仅记录错误，不再降级：', item.newId, err.message);     // 取消降级逻辑
     }
   }
 
-  // 备用方案：打开后台页（当API失败时使用）
-  function openBackupTab(item) {
-    const u = new URL(item.url);
-    u.searchParams.set('tm_autodl', '1');
-    u.searchParams.set('tm_fn', item.filename);
-    u.searchParams.set('tm_newid', item.newId);
-    log('[备用] 打开后台页：', u.toString());
-    GM_openInTab(u.toString(), { active: false, insert: true, setParent: true });
+  /******************* 队列：提交到 Gopeed（内存队列即可） *******************/
+  const __tmQueue = [];                                                   // 内存队列（本页有效）
+  const __tmQueueSet = new Set();                                         // 去重集合（按 newId）
+  let __tmInflight = 0;                                                   // 当前进行中的数量
+  const __tmConcurrency = 2;                                              // 并发提交数量（保守一点）
+
+  /**
+   * 把任务加入队列（避免重复）。
+   * @param {Array<object>} items 任务列表
+   */
+  function enqueue(items) {
+    let added = 0;                                                        // 记录实际新增数
+    for (const it of items) {                                             // 遍历每条
+      if (__tmQueueSet.has(it.newId)) continue;                           // 已存在则跳过
+      __tmQueue.push(it);                                                 // 进入队列
+      __tmQueueSet.add(it.newId);                                         // 加入去重集合
+      added += 1;                                                         // 计数 +1
+    }
+    log(`队列加入 ${added} 条，当前队列总数=${__tmQueue.length}`);          // 输出队列状态
   }
 
-  // 队列处理器（支持并发）
-  let lastQueueSize = -1;
-  async function processQueue(concurrency = 3) {
-    const inflightKey = 'tm_inflight';
-    const inflight = Number(localStorage.getItem(inflightKey) || '0');
-    const q = loadQueue();
-    
-    if (q.length !== lastQueueSize) {
-      if (q.length === 0) {
-        if (lastQueueSize > 0) log('[队列] 全部完成');
-      } else {
-        log(`[队列] 剩余 ${q.length} 个任务`);
-      }
-      lastQueueSize = q.length;
-    }
+  /**
+   * 队列处理器：按并发限制提交给 Gopeed。
+   */
+  async function processQueue() {
+    if (__tmInflight >= __tmConcurrency) return;                          // 并发满了先退出
+    if (__tmQueue.length === 0) return;                                   // 队列为空直接返回
 
-    if (q.length === 0) return;
-    if (inflight >= concurrency) return;
+    const next = __tmQueue.shift();                                       // 取出一个任务
+    __tmQueueSet.delete(next.newId);                                      // 同步去重集合
+    __tmInflight += 1;                                                    // 并发 +1
 
-    const next = q.shift();
-    saveQueue(q);
-    lastQueueSize = q.length;
-
-    localStorage.setItem(inflightKey, String(inflight + 1));
-
-    // 默认：本页负责把 inflight -1（即：下载在本页完成）
-    // 但如果 API 失败改走“后台页下载”，就由后台页在完成/超时后 -1。
-    let shouldDecrementInThisTab = true;
     try {
-      const r = await downloadByApi(next);
-      if (r && r.handoffToTab) shouldDecrementInThisTab = false;
+      await downloadByApi(next);                                          // 执行下载逻辑
     } finally {
-      if (shouldDecrementInThisTab) {
-        const current = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
-        localStorage.setItem(inflightKey, String(current));
-      }
+      __tmInflight = Math.max(0, __tmInflight - 1);                       // 并发 -1，防止负数
     }
   }
 
-  setInterval(() => processQueue(3), 1000);
-
-  function openNextFromQueue(concurrency = 2) {
-    // 用 localStorage 做一个很轻量的“并发计数”
-    const inflightKey = 'tm_inflight';
-    const inflight = Number(localStorage.getItem(inflightKey) || '0');
-
-    if (inflight >= concurrency) {
-      log(`并发已满(${inflight}/${concurrency})，稍后再开下一个`);
-      return;
-    }
-
-    const q = loadQueue();
-    if (!q.length) {
-      log('队列为空：没有要下载的条目');
-      return;
-    }
-
-    const next = q.shift();
-    saveQueue(q);
-
-    // 标记 inflight +1
-    localStorage.setItem(inflightKey, String(inflight + 1));
-
-    const u = new URL(next.url);
-    u.searchParams.set('tm_autodl', '1');
-    u.searchParams.set('tm_fn', next.filename);
-    u.searchParams.set('tm_newid', next.newId);
-
-    log('打开后台页：', u.toString());
-    GM_openInTab(u.toString(), { active: false, insert: true, setParent: true });
-  }
-
-  // 旧的队列调度器已禁用，openNextFromQueue函数仅作为API失败时的降级备用
-
-  /******************* 自动下载模式（后台页自己下载自己） *******************/
-function bytesHuman(n) {
-  if (typeof n !== 'number' || n < 0) return '未知';
-  const units = ['B','KB','MB','GB'];
-  let i = 0, x = n;
-  while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
-  return `${x.toFixed(1)}${units[i]}`;
-}
-
-function ensureDlBox() {
-  // 把进度展示塞进面板里：优先插到 tm_extra，避免打断主列表阅读
-  const host = qs('#tm_extra', panel) || window.__tm_panel || document.body;
-  let box = host.querySelector('#tm_dl_box');
-  if (!box) {
-    box = document.createElement('div');
-    box.id = 'tm_dl_box';
-    box.innerHTML = `
-      <div class="tm-dl-title">下载状态</div>
-      <div id="tm_dl_rows" style="display:flex; flex-direction:column; gap:10px;"></div>
-    `;
-    host.appendChild(box);
-  }
-  return box.querySelector('#tm_dl_rows');
-}
-
-const __tmDlState = new Map(); // filename -> state
-
-function renderDlState() {
-  const rows = ensureDlBox();
-  const items = Array.from(__tmDlState.values()).slice(-6); // 只显示最近6条，免得太长
-  rows.innerHTML = items.map(s => {
-    const pct = (s.total > 0) ? Math.floor((s.loaded / s.total) * 100) : 0;
-    const barW = (s.total > 0) ? pct : 5;
-
-    const color =
-      s.status === 'done' ? '#7CFC00' :
-      s.status === 'error' ? '#ff6b6b' :
-      '#8ab4ff';
-
-    const detail =
-      s.status === 'downloading'
-        ? `${pct}%  ${bytesHuman(s.loaded)}/${bytesHuman(s.total)}  速度≈${bytesHuman(s.speed)}/s`
-        : (s.status === 'done' ? '完成' : (s.err || '失败'));
-
-    return `
-      <div class="tm-dl-item">
-        <div class="tm-dl-top">
-          <div class="tm-dl-name">${escapeHtml(s.filename)}</div>
-          <div class="tm-dl-status tm-dl-status--${escapeHtml(s.status)}">${escapeHtml(s.status)}</div>
-        </div>
-        <div class="tm-bar">
-          <div style="width:${barW}%; background:${color};"></div>
-        </div>
-        <div class="tm-dl-detail">${escapeHtml(detail)}</div>
-      </div>
-    `;
-  }).join('');
-}
-
-/**
- * 把 GM_download 包装成 Promise（关键修复：让“队列并发控制”真正按下载完成来计算）
- *
- * 你反馈的现象：
- * - “同一天 3 节课只下了 2 节，中间莫名少一节”
- * - “过 5 分钟又开始下”
- *
- * 常见根因就是：以前代码只是“发起下载”，并没有等下载真正结束就把队列并发放开了，导致：
- * - 浏览器/站点节流把部分下载排队（你感觉像是“漏了”）
- * - 过一段时间节流解除/队列空出来，又继续（你感觉像“过几分钟又开始了”）
- *
- * 这里我们统一把一次下载抽象成：Promise< {ok:boolean, err?:string} >
- * 上层可以 await 它，队列就不会“提前放行”。
- */
-function __tmStartGmDownload(url, filename) {
-  return new Promise((resolve) => {
-    try {
-      GM_download({
-        url,
-        name: filename,
-        saveAs: false,
-        timeout: 60000, // 1分钟无响应算超时（不影响正常大文件，只是让你能看到“卡住了”）
-
-        onprogress: (e) => {
-          const st = __tmDlState.get(filename);
-          if (!st) return;
-
-          const t = Date.now();
-          const loaded = (typeof e.loaded === 'number') ? e.loaded : st.loaded;
-          const total  = (typeof e.total === 'number') ? e.total : st.total;
-
-          // 粗略速度：最近一次回调的增量 / 时间
-          const dt = Math.max(1, t - st.lastT);
-          const dL = Math.max(0, loaded - st.lastLoaded);
-          const speed = Math.floor((dL * 1000) / dt);
-
-          st.loaded = loaded;
-          st.total = total;
-          st.speed = speed;
-          st.lastT = t;
-          st.lastLoaded = loaded;
-
-          __tmDlState.set(filename, st);
-
-          // 限流渲染，避免太频繁
-          if (!st.__lastRender || t - st.__lastRender > 300) {
-            st.__lastRender = t;
-            renderDlState();
-          }
-        },
-
-        onload: () => resolve({ ok: true }),
-
-        onerror: (err) => {
-          const msg = (err && (err.error || err.message)) ? String(err.error || err.message) : '下载失败';
-          resolve({ ok: false, err: msg });
-        },
-
-        ontimeout: () => resolve({ ok: false, err: '下载超时（网络不稳定/被节流）' }),
-      });
-    } catch (e) {
-      resolve({ ok: false, err: String(e?.message || e || 'GM_download异常') });
-    }
-  });
-}
-
-// 单次下载（不带降级）：返回 Promise，方便上层 await
-async function gmDownload(url, filename) {
-  const now = Date.now();
-  __tmDlState.set(filename, {
-    filename,
-    status: 'downloading',
-    loaded: 0,
-    total: -1,
-    speed: 0,
-    t0: now,
-    lastT: now,
-    lastLoaded: 0,
-    err: ''
-  });
-  renderDlState();
-  log('开始下载：', filename);
-
-  const r = await __tmStartGmDownload(url, filename);
-
-  const st = __tmDlState.get(filename);
-  if (st) {
-    if (r.ok) {
-      st.status = 'done';
-      st.speed = 0;
-      st.err = '';
-    } else {
-      st.status = 'error';
-      st.err = r.err || '下载失败';
-    }
-    __tmDlState.set(filename, st);
-  }
-  renderDlState();
-
-  if (r.ok) log('下载完成：', filename);
-  else log('下载失败：', filename, r.err || '');
-
-  return r;
-}
-
-// 带降级重试的下载函数（先试带参数，失败后试无参数）：返回 Promise，方便上层 await
-async function gmDownloadWithFallback(urlWithKey, urlNoKey, filename) {
-  const now = Date.now();
-  __tmDlState.set(filename, {
-    filename,
-    status: 'downloading',
-    loaded: 0,
-    total: -1,
-    speed: 0,
-    t0: now,
-    lastT: now,
-    lastLoaded: 0,
-    err: ''
-  });
-  renderDlState();
-  log('开始下载(带参数)：', filename);
-
-  const r1 = await __tmStartGmDownload(urlWithKey, filename);
-  if (r1.ok) {
-    const st = __tmDlState.get(filename);
-    if (st) {
-      st.status = 'done';
-      st.speed = 0;
-      st.err = '';
-      __tmDlState.set(filename, st);
-    }
-    renderDlState();
-    log('下载完成：', filename);
-    return r1;
-  }
-
-  // 第一次失败：尝试无参数版本
-  log('[降级] 带参数版本失败，尝试无参数版本：', filename, r1.err || '');
-
-  if (!urlNoKey) {
-    const st = __tmDlState.get(filename);
-    if (st) {
-      st.status = 'error';
-      st.err = r1.err || '带参数失败，且无无参数版本可用';
-      __tmDlState.set(filename, st);
-    }
-    renderDlState();
-    return { ok: false, err: r1.err || '下载失败' };
-  }
-
-  // 为第二次尝试重置一下计数（让 UI 看起来更直观）
-  const st2 = __tmDlState.get(filename);
-  if (st2) {
-    const t = Date.now();
-    st2.status = 'downloading';
-    st2.loaded = 0;
-    st2.total = -1;
-    st2.speed = 0;
-    st2.t0 = t;
-    st2.lastT = t;
-    st2.lastLoaded = 0;
-    st2.err = `降级中：${r1.err || '带参数失败'}`;
-    __tmDlState.set(filename, st2);
-  }
-  renderDlState();
-
-  const r2 = await __tmStartGmDownload(urlNoKey, filename);
-
-  const st = __tmDlState.get(filename);
-  if (st) {
-    if (r2.ok) {
-      st.status = 'done';
-      st.speed = 0;
-      st.err = '';
-    } else {
-      st.status = 'error';
-      st.err = r2.err || '下载失败';
-    }
-    __tmDlState.set(filename, st);
-  }
-  renderDlState();
-
-  if (r2.ok) log('下载完成：', filename);
-  else log('下载失败：', filename, r2.err || '');
-
-  return r2;
-}
-
-
-  async function runAutoDownloadIfNeeded() {
-    if (getParam('tm_autodl') !== '1') return;
-
-    const wantedName = sanitizeFilename(getParam('tm_fn') || '课程录播.mp4');
-    const newId = getParam('tm_newid') || '';
-
-    log('自动下载模式启动，目标文件名：', wantedName);
-
-    // 等待 mp4 出现（最多 25 秒）
-    const start = Date.now();
-    while (Date.now() - start < 25000) {
-      scanPerformance();
-
-      const mp4 = Array.from(mp4Set).find(u => u.includes('tmuvod.smartclass.cn') || u.includes('.mp4'));
-      if (mp4) {
-        log('准备下载：', mp4);
-        // 关键修复：必须等下载真正结束（成功/失败/超时）再释放 inflight，避免并发计数失真
-        const r = await gmDownload(mp4, wantedName);
-
-        // inflight -1
-        const inflightKey = 'tm_inflight';
-        const inflight = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
-        localStorage.setItem(inflightKey, String(inflight));
-
-        // 成功才自动关闭：失败时保留页面，方便你手动点播放/重试排查
-        if (r && r.ok) {
-          // 尝试自动关闭标签页（只对脚本打开的页通常有效；不行也无所谓）
-          setTimeout(() => { try { window.close(); } catch(e) {} }, 3000);
-        } else {
-          log('[自动下载] 本次下载失败，未自动关闭标签页：', wantedName);
-        }
-        return;
-      }
-
-      await new Promise(r => setTimeout(r, 350));
-    }
-
-    log('超时仍未抓到 mp4：这页可能没触发取源接口（后台节流/站点逻辑），建议手动点一下播放再试。');
-
-    // inflight -1
-    const inflightKey = 'tm_inflight';
-    const inflight = Math.max(0, Number(localStorage.getItem(inflightKey) || '1') - 1);
-    localStorage.setItem(inflightKey, String(inflight));
-  }
-
-  runAutoDownloadIfNeeded();
+  setInterval(processQueue, 400);                                         // 轻量轮询（不要太频繁）
 
   /******************* 渲染列表 + 按钮逻辑 *******************/
-  // 记住上一次“日期下拉”的选项集合：
-  // - 目的1：避免 updateUI 每 5 秒重建一次下拉，导致你手动选的日期被“悄悄改回最新日期”
-  // - 目的2：减少 DOM 抖动（下拉闪一下、点选体验差）
-  let __tmLastDatesKey = '';
+  let __tmItemMap = new Map();                                            // newId -> item 映射
+  let __tmItemsByDate = {};                                               // date -> items 映射
 
   function updateUI() {
-    const rec = parseRecommendList();
+    const rec = parseRecommendList();                                     // 解析推荐列表
 
-    const info = qs('#tm_info', panel);
-    info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'}`;
+    const info = qs('#tm_info', panel);                                   // 信息栏 DOM
+    info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 队列=${__tmQueue.length} ｜ 并发=${__tmInflight}/${__tmConcurrency} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'} ｜ Gopeed=${GOPEED_CONFIG.baseUrl} ｜ Token=${GOPEED_CONFIG.apiToken ? '已配置' : '未配置'}`; // 更新状态信息
 
-    // 日期下拉
-    // 下拉里只展示“有效日期”，避免出现空白选项误导你
-    const dates = uniq(rec.map(x => x.date).filter(Boolean)).sort();
-    const sel = qs('#tm_date', panel);
-    const prevValue = sel.value; // 记录“你当前手动选的是哪天”（修复：不会被定时刷新覆盖）
-    const datesKey = dates.join('|'); // 用 join 出一个简单 hash（足够用了）
+    __tmItemMap = new Map(rec.map(it => [it.newId, it]));                 // 建立 newId 映射
+    __tmItemsByDate = groupItemsByDate(rec);                              // 建立日期分组
 
-    // 只有日期集合变化时才重建 options（避免每次都把你选中的值冲掉）
-    if (datesKey !== __tmLastDatesKey) {
-      sel.innerHTML = dates.length
-        ? dates.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('')
-        : `<option value="">(无日期)</option>`;
-      __tmLastDatesKey = datesKey;
+    const list = qs('#tm_list', panel);                                   // 列表容器
+    if (!rec.length) {                                                    // 没有条目
+      list.innerHTML = `<div class="tm-empty">未检测到相关推荐列表（ul.about_video）。</div>`; // 空态提示
+      return;                                                             // 结束
     }
 
-    // 选中逻辑（优先级）：
-    // 1) 如果你之前选的日期还存在，就继续选它
-    // 2) 否则（比如列表变化了），自动选最新日期
-    if (dates.length) {
-      const keep = (prevValue && dates.includes(prevValue)) ? prevValue : '';
-      sel.value = keep || getLatestDate(rec);
-    }
+    const openSet = new Set();                                            // 保存已展开的日期
+    list.querySelectorAll('details.tm-day[open]').forEach(el => {          // 读取现有展开状态
+      const d = el.getAttribute('data-date') || '';                       // 读出日期
+      if (d) openSet.add(d);                                              // 有日期才记录展开状态
+    });
 
-    // 列表展示
-    const list = qs('#tm_list', panel);
-    if (!rec.length) {
-      list.innerHTML = `<div class="tm-empty">未检测到相关推荐列表（ul.about_video）。</div>`;
-      return;
-    }
-    list.innerHTML = rec.map(it => `
-      <div class="tm-item">
-        <div class="tm-item-meta">${escapeHtml(it.meta)}</div>
-        <div class="tm-item-sub">NewID：<span class="tm-mono">${escapeHtml(it.newId)}</span></div>
-        <div class="tm-item-sub">文件名：<span class="tm-mono">${escapeHtml(it.filename)}</span></div>
-      </div>
-    `).join('');
+    const latestDate = getLatestDate(rec);                                // 最新日期（默认展开）
+    const dates = Object.keys(__tmItemsByDate).sort((a, b) => b.localeCompare(a)); // 日期倒序
+
+    list.innerHTML = dates.map(d => {                                     // 逐日渲染
+      const items = __tmItemsByDate[d] || [];                             // 该日期的课程
+      const shouldOpen = openSet.size ? openSet.has(d) : d === latestDate; // 保留展开状态
+      const openAttr = shouldOpen ? 'open' : '';                          // open 属性
+
+      const itemsHtml = items.map(it => `                               // 构建单日条目 HTML
+        <div class="tm-item" data-newid="${escapeHtml(it.newId)}">       
+          <div class="tm-item-row">                                     
+            <div class="tm-item-meta">${escapeHtml(it.meta)}</div>       
+            <div class="tm-item-actions">                               
+              <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(it.newId)}">下载本节</button>
+            </div>
+          </div>
+          <div class="tm-item-sub">NewID：<span class="tm-mono">${escapeHtml(it.newId)}</span></div>
+          <div class="tm-item-sub">文件名：<span class="tm-mono">${escapeHtml(it.filename)}</span></div>
+        </div>
+      `).join('');                                                        // 合并单日条目 HTML
+
+      // 组装“日期分组”的完整 HTML
+      return `
+        <details class="tm-day" data-date="${escapeHtml(d)}" ${openAttr}>
+          <summary class="tm-day-summary">
+            <div>
+              <div class="tm-day-title">${escapeHtml(d)}</div>
+              <div class="tm-day-sub">共 ${items.length} 节</div>
+            </div>
+            <div class="tm-day-actions">
+              <button class="tm-btn primary" type="button" data-action="download-day" data-date="${escapeHtml(d)}">下载当天全部</button>
+            </div>
+          </summary>
+          <div class="tm-day-list">
+            ${itemsHtml}
+          </div>
+        </details>
+      `;
+    }).join('');                                                          // 合并整体 HTML
   }
 
-  setTimeout(updateUI, 1200);
-  setInterval(updateUI, 5000);
+  setTimeout(updateUI, 1200);                                             // 延迟首次刷新（等 DOM 稳定）
+  setInterval(updateUI, 5000);                                            // 定时刷新列表
 
-  // 下载本页：一旦抓到 mp4 就下；没抓到就提示你点播放
-  qs('#tm_dl_this', panel).addEventListener('click', () => {
-    scanPerformance();
-    const mp4 = Array.from(mp4Set).find(u => u.includes('.mp4'));
-    const meta = (qs('#courseName')?.textContent || '').trim();
-    const fn = filenameFromMeta(meta || document.title || '课程录播');
+  // 列表事件：统一用事件委托，避免频繁绑定
+  qs('#tm_list', panel).addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-action]');                 // 找到最近的按钮
+    if (!btn) return;                                                     // 不是按钮就忽略
 
-    if (!mp4) {
-      log('本页尚未抓到 mp4：请点一下播放或稍等 1-2 秒后再点。');
-      return;
+    const summary = btn.closest('summary');                               // 判断是否在 summary 内
+    if (summary) {                                                        // 在 summary 内则阻止折叠
+      ev.preventDefault();                                                // 阻止默认折叠行为
+      ev.stopPropagation();                                               // 阻止事件冒泡
     }
-    log('手动下载本页：', mp4);
-    gmDownload(mp4, fn);
-  });
 
-  // 下载选定日期（队列）
-  qs('#tm_dl_date', panel).addEventListener('click', () => {
-    const rec = parseRecommendList();
-    const d = qs('#tm_date', panel).value;
-    const pick = rec.filter(x => x.date === d);
-    if (!pick.length) { log('该日期无条目：', d); return; }
-    enqueue(pick);
-  });
+    const action = btn.getAttribute('data-action') || '';                 // 取出动作类型
+    if (action === 'download-day') {                                      // 下载整天
+      const d = btn.getAttribute('data-date') || '';                      // 取出日期
+      const items = __tmItemsByDate[d] || [];                             // 取出当天课程
+      if (!items.length) {                                                // 没有课程就提示
+        log('该日期无条目：', d);                                         // 输出日志
+        return;                                                           // 结束
+      }
+      enqueue(items);                                                     // 加入队列
+      return;                                                             // 结束
+    }
 
-  // 下载最新日期（队列）
-  qs('#tm_dl_latest', panel).addEventListener('click', () => {
-    const rec = parseRecommendList();
-    const d = getLatestDate(rec);
-    const pick = rec.filter(x => x.date === d);
-    if (!pick.length) { log('列表里找不到最新日期条目'); return; }
-    log('最新日期为：', d);
-    enqueue(pick);
+    if (action === 'download-item') {                                     // 下载单节
+      const newId = btn.getAttribute('data-newid') || '';                 // 取出 NewID
+      const item = __tmItemMap.get(newId);                                // 取出对应条目
+      if (!item) {                                                        // 找不到条目
+        log('未找到该条目：', newId);                                     // 输出日志
+        return;                                                           // 结束
+      }
+      enqueue([item]);                                                    // 加入队列
+    }
   });
 
 })();
