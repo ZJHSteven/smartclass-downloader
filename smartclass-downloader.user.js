@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.7.3
+// @version      0.7.4
 // @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
@@ -1213,7 +1213,9 @@
     info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 队列=${__tmQueue.length} ｜ 并发=${__tmInflight}/${__tmConcurrency} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'} ｜ Gopeed=${GOPEED_CONFIG.baseUrl} ｜ Token=${GOPEED_CONFIG.apiToken ? '已配置' : '未配置'}`; // 更新状态信息
 
     __tmItemMap = new Map(rec.map(it => [it.newId, it]));                 // 建立 newId 映射
-    __tmItemsByDate = groupItemsByDate(rec);                              // 建立日期分组
+    const currentItem = rec.find(it => it.isCurrent);                     // 当前页条目（如果有）
+    const otherItems = rec.filter(it => !it.isCurrent);                   // 非当前页条目
+    __tmItemsByDate = groupItemsByDate(otherItems);                       // 建立日期分组（排除当前页）
 
     const list = qs('#tm_list', panel);                                   // 列表容器
     if (!rec.length) {                                                    // 没有条目
@@ -1227,10 +1229,25 @@
       if (d) openSet.add(d);                                              // 有日期才记录展开状态
     });
 
-    const latestDate = getLatestDate(rec);                                // 最新日期（用于自动展开）
+    const latestDate = getLatestDate(otherItems);                         // 最新日期（用于自动展开）
     const dates = Object.keys(__tmItemsByDate).sort((a, b) => b.localeCompare(a)); // 日期倒序
 
-    list.innerHTML = dates.map(d => {                                     // 逐日渲染
+    // 1) 当前页条目（如果有）放在最上方，且不包“日期大框”
+    const currentHtml = currentItem ? `
+      <div class="tm-item" data-newid="${escapeHtml(currentItem.newId)}">
+        <div class="tm-item-row">
+          <div class="tm-item-meta">${escapeHtml(currentItem.meta)} <span class="tm-tag">当前页</span></div>
+          <div class="tm-item-actions">
+            <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(currentItem.newId)}">下载本节</button>
+          </div>
+        </div>
+        <div class="tm-item-sub">NewID：<span class="tm-mono">${escapeHtml(currentItem.newId)}</span></div>
+        <div class="tm-item-sub">文件名：<span class="tm-mono">${escapeHtml(currentItem.filename)}</span></div>
+      </div>
+    ` : '';
+
+    // 2) 其它课程仍按日期分组显示
+    const groupedHtml = dates.map(d => {                                  // 逐日渲染
       const items = __tmItemsByDate[d] || [];                             // 该日期的课程
       const shouldOpen = openSet.size                                     // 是否已有展开记录
         ? openSet.has(d)                                                  // 有记录就按记录决定
@@ -1240,7 +1257,7 @@
       const itemsHtml = items.map(it => `                               // 构建单日条目 HTML
         <div class="tm-item" data-newid="${escapeHtml(it.newId)}">       
           <div class="tm-item-row">                                     
-            <div class="tm-item-meta">${escapeHtml(it.meta)}${it.isCurrent ? ' <span class="tm-tag">当前页</span>' : ''}</div>       
+            <div class="tm-item-meta">${escapeHtml(it.meta)}</div>       
             <div class="tm-item-actions">                               
               <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(it.newId)}">下载本节</button>
             </div>
@@ -1268,6 +1285,8 @@
         </details>
       `;
     }).join('');                                                          // 合并整体 HTML
+
+    list.innerHTML = `${currentHtml}${groupedHtml}`;                      // 合并输出（当前页在最上）
   }
 
   setTimeout(updateUI, 1200);                                             // 延迟首次刷新（等 DOM 稳定）
