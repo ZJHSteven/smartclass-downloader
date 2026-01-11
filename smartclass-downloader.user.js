@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.7.2
+// @version      0.7.3
 // @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
@@ -776,6 +776,17 @@
       align-items: center;
     }
     #tm_panel .tm-item-actions { display: flex; gap: 8px; }
+    #tm_panel .tm-tag {
+      display: inline-block;
+      padding: 0 6px;
+      border-radius: 999px;
+      background: rgba(255, 208, 92, 0.20);
+      color: #ffd36b;
+      font-size: 11px;
+      font-weight: 900;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
     #tm_panel .tm-item-meta { font-weight: 900; color: #ffffff; margin-bottom: 6px; }
     #tm_panel .tm-item-sub { color: rgba(255, 255, 255, 0.90); margin-top: 4px; }
     #tm_panel .tm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
@@ -995,6 +1006,48 @@
   setInterval(scanPerformance, 1200);
 
   /******************* 解析“相关推荐” *******************/
+  /**
+   * 构造“当前页面课程”的条目（用于补齐列表）。
+   * @returns {object|null} 当前页条目；如果拿不到 NewID 则返回 null
+   */
+  function buildCurrentPageItem() {
+    const newId = getParam('NewID') || getParam('NewId') || '';           // 优先从 URL 拿当前页 NewID
+    if (!newId) return null;                                              // 没有 NewID 就无法走 API，直接放弃
+
+    const titleEl = qs('#courseName');                                    // 页面上的课程标题节点
+    const metaRaw = (titleEl?.getAttribute('title') || titleEl?.textContent || '').trim(); // 优先用 title，其次 text
+    const meta = metaRaw || (document.title || '').trim();                // 如果都没有，再兜底用 document.title
+
+    const filename = filenameFromMeta(meta || `NewID_${newId}`);          // 用现有规则生成文件名
+    const date = parseDate(meta);                                         // 尝试从 meta 解析日期（失败就为空）
+
+    return {                                                              // 组装成与推荐列表一致的结构
+      newId,                                                              // NewID（关键字段）
+      url: location.href,                                                 // 当前页面 URL
+      meta: meta || `当前课程（NewID=${newId}）`,                          // meta 文本兜底
+      date,                                                               // 解析到的日期
+      filename,                                                           // 生成的文件名
+      isCurrent: true                                                     // 标记：这是当前页
+    };
+  }
+
+  /**
+   * 把“当前页课程”合并进列表（避免重复）。
+   * @param {Array<object>} items 推荐列表
+   */
+  function mergeCurrentPageItem(items) {
+    const current = buildCurrentPageItem();                               // 先构造当前页条目
+    if (!current) return;                                                 // 构造失败则不处理
+
+    const hasSameNewId = items.some(it => it.newId && it.newId === current.newId); // 判断是否已存在同 NewID
+    if (hasSameNewId) return;                                             // 已存在就不重复添加
+
+    const hasSameFilename = items.some(it => it.filename === current.filename); // 再判断是否同文件名
+    if (hasSameFilename) return;                                          // 同文件名也视为已包含
+
+    items.push(current);                                                  // 追加到列表
+  }
+
   function parseRecommendList() {
     const ul = qs('ul.about_video');                                     // 推荐列表容器
     if (!ul) return [];                                                  // 没找到直接返回空数组
@@ -1020,6 +1073,7 @@
       }
     });
 
+    mergeCurrentPageItem(items);                                         // 把当前页课程补进列表
     sortItemsForDisplay(items);                                          // 按日期倒序 + 时间排序
     return items;                                                        // 返回结果
   }
@@ -1030,6 +1084,9 @@
    */
   function sortItemsForDisplay(items) {
     items.sort((a, b) => {                                                // 自定义排序
+      const ca = !!a.isCurrent;                                           // 是否当前页 A
+      const cb = !!b.isCurrent;                                           // 是否当前页 B
+      if (ca !== cb) return ca ? -1 : 1;                                  // 当前页优先显示在最上
       const da = a.date || '';                                            // A 的日期
       const db = b.date || '';                                            // B 的日期
       if (da !== db) return db.localeCompare(da);                         // 日期倒序
@@ -1183,7 +1240,7 @@
       const itemsHtml = items.map(it => `                               // 构建单日条目 HTML
         <div class="tm-item" data-newid="${escapeHtml(it.newId)}">       
           <div class="tm-item-row">                                     
-            <div class="tm-item-meta">${escapeHtml(it.meta)}</div>       
+            <div class="tm-item-meta">${escapeHtml(it.meta)}${it.isCurrent ? ' <span class="tm-tag">当前页</span>' : ''}</div>       
             <div class="tm-item-actions">                               
               <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(it.newId)}">下载本节</button>
             </div>
