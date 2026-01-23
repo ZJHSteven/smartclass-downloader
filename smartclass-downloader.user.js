@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.7.4
+// @version      0.7.5
 // @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start

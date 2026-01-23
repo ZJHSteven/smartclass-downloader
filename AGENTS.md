@@ -14,6 +14,7 @@
 - 每次功能/修复发布时：
   - 同步更新 `smartclass-downloader.user.js` 头部的 `@version`
   - 同步更新 `CHANGELOG.md`，写清楚“改了什么、为什么改、影响范围”
+  - 自动更新依赖 `@version` 递增，修复类改动也必须提升版本号
 
 ### 2) `csrkToken` 获取策略（避免“验证不通过”）
 
@@ -62,7 +63,7 @@
 - **默认地址**：`http://127.0.0.1:9999`
 - **Token 头**：`x-api-token`
 - **任务创建模式**：`tasks | batch | request`（在脚本 `GOPEED_CONFIG.createMode` 中配置）
-- **文件名/保存路径**：优先使用 `opt.name`/`opt.path`（若你的 Gopeed 版本不支持，可改用 `request` 模式并仅传 `url`）
+- **文件名/保存路径**：优先使用 `opts.name`/`opts.path`（若你的 Gopeed 版本不支持，可改用 `request` 模式并仅传 `url`）
 
 > 这样可以利用 Gopeed 的断点续传与失败重试能力，减少浏览器下载失败/重命名的问题。
 
