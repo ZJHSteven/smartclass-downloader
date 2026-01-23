@@ -255,7 +255,7 @@
    * 构造 Gopeed “创建任务”请求体。
    * @param {string} url 下载地址
    * @param {string} filename 期望的文件名
-   * @returns {{req: object, opt?: object}} 任务创建结构
+   * @returns {{req: object, opts?: object}} 任务创建结构
    */
   function buildGopeedCreateTaskBody(url, filename) {
     const req = {                                                        // Gopeed 的 Request 结构
@@ -266,16 +266,16 @@
       req.extra = { header: extraHeaders };                              // HttpReqExtra：header
     }
 
-    const opt = {};                                                      // Options：下载选项
+    const opts = {};                                                     // Options：下载选项（Gopeed 新版字段名）
     if (filename) {                                                      // 有文件名才设置
-      opt.name = filename;                                               // 自定义文件名
+      opts.name = filename;                                              // 自定义文件名
     }
     if (GOPEED_CONFIG.defaultSavePath) {                                 // 有默认目录才设置
-      opt.path = GOPEED_CONFIG.defaultSavePath;                          // 自定义保存路径
+      opts.path = GOPEED_CONFIG.defaultSavePath;                         // 自定义保存路径
     }
 
     const body = { req };                                                // 先放 req
-    if (Object.keys(opt).length > 0) body.opt = opt;                      // 只有有字段才挂 opt
+    if (Object.keys(opts).length > 0) body.opts = opts;                  // 只有有字段才挂 opts
     return body;                                                         // 返回最终 body
   }
 
@@ -286,7 +286,7 @@
    * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
    */
   async function submitGopeedTask(url, filename) {
-    const body = buildGopeedCreateTaskBody(url, filename);               // 生成任务 body（req + opt）
+    const body = buildGopeedCreateTaskBody(url, filename);               // 生成任务 body（req + opts）
 
     if (GOPEED_CONFIG.createMode === 'tasks') {                          // 模式：单任务 /api/tasks
       const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.tasksPath); // 拼接 URL
@@ -296,7 +296,7 @@
     if (GOPEED_CONFIG.createMode === 'batch') {                          // 模式：批量 /api/tasks/batch
       const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.batchPath); // 拼接 URL
       const batchBody = { reqs: [body.req] };                             // 只放一个请求，也合法
-      if (body.opt) batchBody.opt = body.opt;                             // 有 opt 才挂上
+      if (body.opts) batchBody.opts = body.opts;                          // 有 opts 才挂上
       return await gmRequestJson('POST', endpoint, batchBody, GOPEED_CONFIG.timeoutMs); // 提交
     }
 
