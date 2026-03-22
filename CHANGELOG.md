@@ -1,5 +1,21 @@
 # 更新日志
 
+## v0.8.0 - ClassFlow 后端投递模式（2026-03-22）
+
+### 🚀 新增投递模式
+- 保留原有 `Gopeed` 下载模式，同时新增 `ClassFlow` 后端投递模式
+- 面板新增滑块开关，可在 `Gopeed / ClassFlow` 之间切换，并自动记住当前选择
+- 新增 `ClassFlow` 配置项：后端地址、Bearer Token、默认学期
+
+### 🧾 请求体与队列
+- “下载当天全部”在 `ClassFlow` 模式下会真正一次性提交成一个 batch，而不是拆成多个独立请求
+- 新增后端 intake 请求体组装逻辑：自动传递 `new_id / mp4_url / course_name / teacher_name / date / start_time / end_time / raw_title`
+- 多片段课程会自动补 `__segN` 后缀，避免后端把不同片段误判成重复任务
+
+### ✅ 测试
+- 新增 `node:test` 单测，覆盖日期解析、时间段解析、ClassFlow 单片段/批量请求体组装
+- userscript 文件在 Node 环境下会只导出纯函数，不会启动浏览器 UI，便于直接做脚本级测试
+
 ## v0.7.5 - Gopeed opts 参数修复（2026-01-23）
 
 ### 🚀 下载链路

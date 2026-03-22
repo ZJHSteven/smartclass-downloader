@@ -1,16 +1,18 @@
 // ==UserScript==
-// @name         智慧课堂：批量抓MP4 + Gopeed外部下载（队列版）
+// @name         智慧课堂：批量抓MP4 + Gopeed / ClassFlow 双模式投递
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.7.5
-// @description  通过API获取视频信息，批量提交到Gopeed外部下载器（不走浏览器下载）。
+// @version      0.8.0
+// @description  通过API获取视频信息，可批量提交到Gopeed外部下载器，或一次性投递到ClassFlow后端。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
 // @grant        GM_xmlhttpRequest
-// @connect      127.0.0.1
+// @connect      *
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  const __isBrowserRuntime = typeof window !== 'undefined' && typeof document !== 'undefined';
 
   /************* csrkToken 捕获与缓存（核心修复） *************
    *
@@ -27,15 +29,33 @@
    * - 脚本尽早运行（metadata 里加 @run-at document-start）
    * - hook XHR / fetch 时，遇到 /Video/GetVideoInfoDtoByID 就把请求里的 csrkToken 抠出来
    * - 抠到后写入 localStorage，后续 API 直接复用，不再“猜”
-   ***********************************************************/
+  ***********************************************************/
   const CSRK_STORE_KEY = 'tm_csrkToken_v2'; // localStorage 的 key（改版本号避免污染旧值）
+  const DESTINATION_MODE_STORE_KEY = 'tm_destination_mode_v1'; // 记录当前投递模式：gopeed / classflow
+  const CLASSFLOW_BASE_URL_STORE_KEY = 'tm_classflow_base_url_v1'; // 记录 ClassFlow 后端地址
+  const CLASSFLOW_TOKEN_STORE_KEY = 'tm_classflow_token_v1'; // 记录 ClassFlow Bearer Token
+  const CLASSFLOW_SEMESTER_STORE_KEY = 'tm_classflow_semester_v1'; // 记录默认学期（可为空）
   let __tmCsrkToken = '';                  // 运行时内存缓存：优先读它，避免每次都碰 localStorage
+  let __tmDestinationMode = 'gopeed';      // 默认仍保留 Gopeed，避免升级后突然切到新链路
+  let __tmClassFlowBaseUrl = '';           // ClassFlow 后端基址
+  let __tmClassFlowToken = '';             // ClassFlow Bearer Token
+  let __tmClassFlowSemester = '';          // 默认学期
 
   // 读取历史缓存（在某些隐私模式下 localStorage 可能会抛异常，所以要 try/catch）
-  try {
-    __tmCsrkToken = String(localStorage.getItem(CSRK_STORE_KEY) || '').trim();
-  } catch (e) {
-    __tmCsrkToken = '';
+  if (__isBrowserRuntime) {
+    try {
+      __tmCsrkToken = String(localStorage.getItem(CSRK_STORE_KEY) || '').trim();
+      __tmDestinationMode = normalizeDestinationMode(localStorage.getItem(DESTINATION_MODE_STORE_KEY) || 'gopeed');
+      __tmClassFlowBaseUrl = normalizeClassFlowBaseUrl(localStorage.getItem(CLASSFLOW_BASE_URL_STORE_KEY) || '');
+      __tmClassFlowToken = String(localStorage.getItem(CLASSFLOW_TOKEN_STORE_KEY) || '').trim();
+      __tmClassFlowSemester = String(localStorage.getItem(CLASSFLOW_SEMESTER_STORE_KEY) || '').trim();
+    } catch (e) {
+      __tmCsrkToken = '';
+      __tmDestinationMode = 'gopeed';
+      __tmClassFlowBaseUrl = '';
+      __tmClassFlowToken = '';
+      __tmClassFlowSemester = '';
+    }
   }
 
   /**
@@ -168,6 +188,14 @@
   };
 
   /**
+   * ClassFlow 后端固定协议配置。
+   */
+  const CLASSFLOW_CONFIG = {
+    intakePath: '/api/v1/intake/batches',
+    timeoutMs: 20000
+  };
+
+  /**
    * UI 行为配置（默认值偏保守，避免自动展开打扰）
    */
   const UI_CONFIG = {
@@ -175,6 +203,37 @@
     refreshMs: 5000,                       // UI 刷新间隔（毫秒）
     miniLogLines: 2                        // 迷你日志默认展示行数
   };
+
+  /**
+   * 统一规范化“投递模式”。
+   * @param {string} value 任意输入值
+   * @returns {'gopeed' | 'classflow'} 合法模式
+   */
+  function normalizeDestinationMode(value) {
+    return String(value || '').trim().toLowerCase() === 'classflow' ? 'classflow' : 'gopeed';
+  }
+
+  /**
+   * 统一清洗 ClassFlow 基址，避免末尾斜杠导致 URL 拼接重复。
+   * @param {string} value 用户输入值
+   * @returns {string} 清洗后的地址
+   */
+  function normalizeClassFlowBaseUrl(value) {
+    return String(value || '').trim().replace(/\/+$/g, '');
+  }
+
+  /**
+   * 持久化当前模式与 ClassFlow 配置。
+   */
+  function persistRuntimeSettings() {
+    if (!__isBrowserRuntime) return;
+    try {
+      localStorage.setItem(DESTINATION_MODE_STORE_KEY, __tmDestinationMode);
+      localStorage.setItem(CLASSFLOW_BASE_URL_STORE_KEY, __tmClassFlowBaseUrl);
+      localStorage.setItem(CLASSFLOW_TOKEN_STORE_KEY, __tmClassFlowToken);
+      localStorage.setItem(CLASSFLOW_SEMESTER_STORE_KEY, __tmClassFlowSemester);
+    } catch (e) {}
+  }
 
   /**
    * 统一拼接 baseUrl + path，避免出现双斜杠或漏斜杠。
@@ -203,6 +262,20 @@
   }
 
   /**
+   * 构造 ClassFlow 后端请求头。
+   * @returns {Record<string, string>} 请求头对象
+   */
+  function buildClassFlowHeaders() {
+    const headers = {};
+    headers['accept'] = 'application/json';
+    headers['content-type'] = 'application/json';
+    if (__tmClassFlowToken) {
+      headers['Authorization'] = `Bearer ${__tmClassFlowToken}`;
+    }
+    return headers;
+  }
+
+  /**
    * 构造“下载请求”需要的 HTTP 头（给 Gopeed 代请求时用）。
    * @returns {Record<string, string>} 请求头对象
    */
@@ -223,15 +296,16 @@
    * @param {string} url 完整 URL
    * @param {object|null} bodyObj JSON 对象（GET 时可传 null）
    * @param {number} timeoutMs 超时毫秒数
+   * @param {Record<string, string>} headers 请求头
    * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
    */
-  function gmRequestJson(method, url, bodyObj, timeoutMs) {
+  function gmRequestJson(method, url, bodyObj, timeoutMs, headers) {
     return new Promise((resolve) => {                                     // 用 Promise 包一层方便 await
       const bodyText = bodyObj ? JSON.stringify(bodyObj) : '';            // POST 才需要 body
       GM_xmlhttpRequest({                                                 // 调用 Tampermonkey 的跨域请求
         method: method,                                                   // 设置方法
         url: url,                                                         // 设置 URL
-        headers: buildGopeedHeaders(),                                    // 设置 Gopeed API 头
+        headers: headers || {},                                           // 由调用方决定本次请求头
         data: bodyText,                                                   // 写入请求体
         timeout: timeoutMs,                                               // 设置超时
         onload: (resp) => {                                               // 成功返回
@@ -290,20 +364,20 @@
 
     if (GOPEED_CONFIG.createMode === 'tasks') {                          // 模式：单任务 /api/tasks
       const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.tasksPath); // 拼接 URL
-      return await gmRequestJson('POST', endpoint, body, GOPEED_CONFIG.timeoutMs); // 直接提交
+      return await gmRequestJson('POST', endpoint, body, GOPEED_CONFIG.timeoutMs, buildGopeedHeaders()); // 直接提交
     }
 
     if (GOPEED_CONFIG.createMode === 'batch') {                          // 模式：批量 /api/tasks/batch
       const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.batchPath); // 拼接 URL
       const batchBody = { reqs: [body.req] };                             // 只放一个请求，也合法
       if (body.opts) batchBody.opts = body.opts;                          // 有 opts 才挂上
-      return await gmRequestJson('POST', endpoint, batchBody, GOPEED_CONFIG.timeoutMs); // 提交
+      return await gmRequestJson('POST', endpoint, batchBody, GOPEED_CONFIG.timeoutMs, buildGopeedHeaders()); // 提交
     }
 
     // 兜底模式：/request（官方文档明确有此端点，但不保证支持 name/path）
     const endpoint = joinUrl(GOPEED_CONFIG.baseUrl, GOPEED_CONFIG.requestPath); // 拼接 URL
     const requestBody = { url: url, labels: { filename: filename || '' } };     // 只提交 url + 标签
-    return await gmRequestJson('POST', endpoint, requestBody, GOPEED_CONFIG.timeoutMs); // 提交
+    return await gmRequestJson('POST', endpoint, requestBody, GOPEED_CONFIG.timeoutMs, buildGopeedHeaders()); // 提交
   }
 
   /******************* 文件命名（新规则 v2） *******************/
@@ -447,6 +521,132 @@
     if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`; // 同样统一
 
     return ''; // 解析不了：就返回空，调用方再决定怎么处理
+  }
+
+  /**
+   * 从 meta 文本里解析上课时间段。
+   *
+   * 支持：
+   * - `08:00:00-08:45:00`
+   * - `08:00-08:45`
+   *
+   * @param {string} meta 课程标题文本
+   * @returns {{startHHmm: string, endHHmm: string}} 解析到的时间段；失败则返回空串
+   */
+  function parseTimeRangeFromMeta(meta) {
+    const s = String(meta ?? '');
+    const m = s.match(/(\d{2}:\d{2})(?::\d{2})?\s*-\s*(\d{2}:\d{2})(?::\d{2})?/);
+    if (!m) {
+      return { startHHmm: '', endHHmm: '' };
+    }
+    return { startHHmm: m[1], endHHmm: m[2] };
+  }
+
+  /**
+   * 从 API 返回里安全地提取老师名。
+   * @param {any} videoInfo `/Video/GetVideoInfoDtoByID` 返回的 Value
+   * @returns {string} 教师名
+   */
+  function getTeacherNameFromVideoInfo(videoInfo) {
+    return (videoInfo?.TeacherList && videoInfo.TeacherList[0] && videoInfo.TeacherList[0].Name)
+      ? String(videoInfo.TeacherList[0].Name).trim()
+      : '未知教师';
+  }
+
+  /**
+   * 把单个视频片段标准化成 ClassFlow 后端要求的 intake item。
+   *
+   * 这里故意做得“保守而完整”：
+   *
+   * 1. `mp4_url` 一律优先使用无参数版本，避免 authKey 过期。
+   * 2. 时间优先用 segment 本身，其次退回 videoInfo，再退回页面 meta。
+   * 3. 多片段场景给 `new_id` 补片段后缀，避免后端误判成重复任务。
+   *
+   * @param {object} input 输入对象
+   * @param {object} input.item 页面条目
+   * @param {any} input.videoInfo 接口返回
+   * @param {any} input.segment 单个视频片段
+   * @param {number} input.segmentIndex 片段索引（从 0 开始）
+   * @param {number} input.segmentCount 片段总数
+   * @returns {object|null} 成功返回 intake item，失败返回 null
+   */
+  function buildClassFlowIntakeItem({ item, videoInfo, segment, segmentIndex, segmentCount }) {
+    const metaTime = parseTimeRangeFromMeta(item?.meta || '');
+    const mp4Url = pickMp4Url(segment?.PlayFileUri || '');
+    if (!mp4Url) {
+      return null;
+    }
+
+    const startSource = String(segment?.StartTime || videoInfo?.StartTime || '').trim();
+    const endSource = String(segment?.StopTime || videoInfo?.StopTime || '').trim();
+    const startHHmm = startSource.slice(11, 16) || metaTime.startHHmm;
+    const endHHmm = endSource.slice(11, 16) || metaTime.endHHmm;
+    const dateYmd = startSource.slice(0, 10) || parseDate(item?.meta || '');
+    const courseName = String(videoInfo?.CourseName || '').trim() || '课程';
+    const teacherName = getTeacherNameFromVideoInfo(videoInfo);
+    const segmentSuffix = segmentCount > 1 ? `__seg${segmentIndex + 1}` : '';
+    const titleSuffix = segmentCount > 1 ? ` [片段${segmentIndex + 1}/${segmentCount}]` : '';
+
+    return {
+      new_id: `${String(item?.newId || '').trim()}${segmentSuffix}`,
+      page_url: String(item?.url || location.href || '').trim(),
+      mp4_url: mp4Url,
+      course_name: courseName,
+      teacher_name: teacherName,
+      date: dateYmd,
+      start_time: startHHmm,
+      end_time: endHHmm,
+      raw_title: `${String(item?.meta || '').trim() || '课程录播'}${titleSuffix}`
+    };
+  }
+
+  /**
+   * 把多个“页面条目 + API 结果”组装成一次 ClassFlow batch 请求体。
+   *
+   * @param {object} input 输入对象
+   * @param {Array<{item: object, videoInfo: any}>} input.resolvedItems 已解析完成的条目
+   * @param {string} [input.semester] 可选：默认学期
+   * @returns {{source: string, semester?: string, items: Array<object>}} 后端 intake 请求体
+   */
+  function buildClassFlowBatchRequest({ resolvedItems, semester }) {
+    const items = [];
+
+    for (const resolved of resolvedItems || []) {
+      const item = resolved?.item || {};
+      const videoInfo = resolved?.videoInfo || {};
+      const segments = Array.isArray(videoInfo.VideoSegmentInfo) ? videoInfo.VideoSegmentInfo : [];
+      const safeSegments = segments.length ? segments : [{ PlayFileUri: videoInfo?.PlayFileUri || '' }];
+
+      for (let index = 0; index < safeSegments.length; index += 1) {
+        const normalized = buildClassFlowIntakeItem({
+          item,
+          videoInfo,
+          segment: safeSegments[index],
+          segmentIndex: index,
+          segmentCount: safeSegments.length
+        });
+
+        if (!normalized) continue;
+        if (!normalized.new_id || !normalized.date || !normalized.start_time || !normalized.end_time) continue;
+        items.push(normalized);
+      }
+    }
+
+    items.sort((left, right) => {
+      if (left.date !== right.date) return left.date.localeCompare(right.date);
+      if (left.start_time !== right.start_time) return left.start_time.localeCompare(right.start_time);
+      return left.new_id.localeCompare(right.new_id);
+    });
+
+    const body = {
+      source: 'userscript',
+      items
+    };
+    const normalizedSemester = String(semester || '').trim();
+    if (normalizedSemester) {
+      body.semester = normalizedSemester;
+    }
+    return body;
   }
 
   // 从 PlayFileUri 推导出 mp4 地址（我们优先使用“无参数”的纯净版本）
@@ -598,6 +798,31 @@
     }
   }
 
+  /**
+   * Node 环境下导出纯函数，便于做语法外的真实单测。
+   *
+   * 这里刻意只导出“无副作用的组装/解析函数”，避免测试把整个浏览器 UI 也跑起来。
+   */
+  const __tmTestExports = {
+    normalizeDestinationMode,
+    normalizeClassFlowBaseUrl,
+    parseDate,
+    parseTimeRangeFromMeta,
+    buildMp4FilenameV2,
+    filenameFromMeta,
+    buildClassFlowIntakeItem,
+    buildClassFlowBatchRequest,
+    getTeacherNameFromVideoInfo
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = __tmTestExports;
+  }
+
+  if (!__isBrowserRuntime) {
+    return;
+  }
+
   /******************* UI + 日志 *******************/
   // 统一把 UI 样式抽出来：
   // - 避免一坨 inline style 难维护
@@ -655,6 +880,109 @@
       border: 1px solid rgba(255, 255, 255, 0.10);
       color: rgba(255, 255, 255, 0.92);
       margin-bottom: 10px;
+    }
+
+    #tm_panel .tm-settings {
+      padding: 10px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      margin-bottom: 10px;
+    }
+    #tm_panel .tm-settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    #tm_panel .tm-settings-title {
+      font-weight: 900;
+      color: #ffffff;
+    }
+    #tm_panel .tm-settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    #tm_panel .tm-settings-note {
+      color: rgba(255, 255, 255, 0.82);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+    #tm_panel .tm-field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    #tm_panel .tm-field.tm-field--full {
+      grid-column: 1 / -1;
+    }
+    #tm_panel .tm-field-label {
+      color: rgba(255, 255, 255, 0.90);
+      font-weight: 800;
+    }
+    #tm_panel .tm-input {
+      width: 100%;
+      appearance: none;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(4, 7, 14, 0.38);
+      color: #ffffff;
+      padding: 8px 10px;
+      border-radius: 10px;
+      outline: none;
+    }
+    #tm_panel .tm-input::placeholder {
+      color: rgba(255, 255, 255, 0.38);
+    }
+    #tm_panel .tm-input:focus {
+      border-color: rgba(122, 188, 255, 0.9);
+      box-shadow: 0 0 0 3px rgba(73, 135, 255, 0.18);
+    }
+    #tm_panel .tm-switch {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      width: 108px;
+      height: 34px;
+      padding: 4px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      cursor: pointer;
+    }
+    #tm_panel .tm-switch input {
+      display: none;
+    }
+    #tm_panel .tm-switch-track {
+      position: absolute;
+      inset: 4px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+    }
+    #tm_panel .tm-switch-thumb {
+      position: absolute;
+      left: 4px;
+      top: 4px;
+      width: 46px;
+      height: 24px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, rgba(79, 140, 255, 0.95), rgba(122, 92, 255, 0.95));
+      transition: transform 140ms ease;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+    }
+    #tm_panel .tm-switch-labels {
+      position: relative;
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      padding: 0 8px;
+      font-size: 11px;
+      font-weight: 900;
+      color: rgba(255, 255, 255, 0.88);
+    }
+    #tm_panel .tm-switch input:checked + .tm-switch-track + .tm-switch-thumb {
+      transform: translateX(54px);
     }
 
     #tm_panel .tm-btn {
@@ -791,6 +1119,11 @@
     #tm_panel .tm-item-sub { color: rgba(255, 255, 255, 0.90); margin-top: 4px; }
     #tm_panel .tm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
     #tm_panel .tm-empty { color: rgba(255, 255, 255, 0.88); padding: 10px; }
+    @media (max-width: 640px) {
+      #tm_panel .tm-settings-grid {
+        grid-template-columns: 1fr;
+      }
+    }
   `;
   document.documentElement.appendChild(tmStyle);
 
@@ -798,7 +1131,7 @@
   panel.id = 'tm_panel';
   panel.innerHTML = `
     <div class="tm-header">
-      <div class="tm-title">智慧课堂下载助手（API加速版）</div>
+      <div class="tm-title">智慧课堂下载助手（Gopeed / ClassFlow）</div>
       <div class="tm-actions">
         <button id="tm_toggle" class="tm-btn ghost" type="button" title="折叠/展开面板">折叠</button>
         <button id="tm_clear" class="tm-btn" type="button" title="清空日志">清空日志</button>
@@ -808,12 +1141,46 @@
     <div id="tm_body" class="tm-body">
       <div id="tm_info" class="tm-info"></div>
 
+      <div class="tm-settings">
+        <div class="tm-settings-row">
+          <div>
+            <div class="tm-settings-title">投递模式</div>
+            <div class="tm-settings-note">切到 ClassFlow 后，“当天全部”会一次性提交成一个后端 batch。</div>
+          </div>
+          <label class="tm-switch" title="切换 Gopeed / ClassFlow">
+            <input id="tm_mode_toggle" type="checkbox">
+            <span class="tm-switch-track"></span>
+            <span class="tm-switch-thumb"></span>
+            <span class="tm-switch-labels"><span>Gopeed</span><span>ClassFlow</span></span>
+          </label>
+        </div>
+
+        <div class="tm-settings-grid">
+          <label class="tm-field tm-field--full">
+            <span class="tm-field-label">ClassFlow 后端地址</span>
+            <input id="tm_classflow_base_url" class="tm-input" type="text" placeholder="https://classflow-backend.example.com">
+          </label>
+          <label class="tm-field tm-field--full">
+            <span class="tm-field-label">ClassFlow Bearer Token</span>
+            <input id="tm_classflow_token" class="tm-input" type="password" placeholder="粘贴后端 Bearer Token">
+          </label>
+          <label class="tm-field">
+            <span class="tm-field-label">默认学期</span>
+            <input id="tm_classflow_semester" class="tm-input" type="text" placeholder="2025-2026-2">
+          </label>
+          <div class="tm-field">
+            <span class="tm-field-label">模式说明</span>
+            <div id="tm_mode_hint" class="tm-settings-note"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="tm-help">
         <div class="tm-help-title">使用提示</div>
         <ul>
-          <li>已改为 <code>Gopeed</code> 外部下载器提交任务（不再使用浏览器下载）。</li>
-          <li>请确认 Gopeed 已开启 TCP API，并配置了 Token（示例：<code>x-api-token</code>）。</li>
-          <li>列表按日期倒序展示，可下载“整天”或“单节”。</li>
+          <li>支持 <code>Gopeed</code> 下载模式，也支持 <code>ClassFlow</code> 后端转写模式。</li>
+          <li>Gopeed 模式会把每个视频片段提交给下载器；ClassFlow 模式会一次性投递到后端。</li>
+          <li>列表按日期倒序展示，可操作“当天全部”或“单节”。</li>
         </ul>
       </div>
 
@@ -888,6 +1255,48 @@
 
   renderLogMini();                                                        // 初始化迷你日志
   qs('#tm_clear', panel).addEventListener('click', () => clearLogs());     // 清空按钮
+
+  const modeToggleEl = qs('#tm_mode_toggle', panel);
+  const modeHintEl = qs('#tm_mode_hint', panel);
+  const classFlowBaseUrlEl = qs('#tm_classflow_base_url', panel);
+  const classFlowTokenEl = qs('#tm_classflow_token', panel);
+  const classFlowSemesterEl = qs('#tm_classflow_semester', panel);
+
+  /**
+   * 把当前运行时配置同步到设置面板。
+   */
+  function syncSettingsUI() {
+    modeToggleEl.checked = __tmDestinationMode === 'classflow';
+    classFlowBaseUrlEl.value = __tmClassFlowBaseUrl;
+    classFlowTokenEl.value = __tmClassFlowToken;
+    classFlowSemesterEl.value = __tmClassFlowSemester;
+    modeHintEl.textContent = __tmDestinationMode === 'classflow'
+      ? '当前会把解析出的所有视频片段统一推送到 ClassFlow 后端。'
+      : '当前会把解析出的所有视频片段继续提交给 Gopeed 下载器。';
+  }
+
+  /**
+   * 统一接收“设置发生变化”事件。
+   * 这里做三件事：
+   * 1. 更新内存中的当前值；
+   * 2. 写回 localStorage；
+   * 3. 立即刷新面板，让按钮文案和状态栏同步变化。
+   */
+  function handleSettingsChanged() {
+    __tmDestinationMode = modeToggleEl.checked ? 'classflow' : 'gopeed';
+    __tmClassFlowBaseUrl = normalizeClassFlowBaseUrl(classFlowBaseUrlEl.value);
+    __tmClassFlowToken = String(classFlowTokenEl.value || '').trim();
+    __tmClassFlowSemester = String(classFlowSemesterEl.value || '').trim();
+    persistRuntimeSettings();
+    syncSettingsUI();
+    updateUI();
+  }
+
+  modeToggleEl.addEventListener('change', () => handleSettingsChanged());
+  classFlowBaseUrlEl.addEventListener('change', () => handleSettingsChanged());
+  classFlowTokenEl.addEventListener('change', () => handleSettingsChanged());
+  classFlowSemesterEl.addEventListener('change', () => handleSettingsChanged());
+  syncSettingsUI();
 
   // 面板折叠/展开：给屏幕留空间（把状态存到 localStorage，刷新后还能记住）
   (function initPanelCollapse(){
@@ -1120,66 +1529,155 @@
   }
 
   /**
-   * 通过 API 获取 mp4，再把任务提交给 Gopeed。
-   * @param {object} item 单条课程信息
+   * 统一把一个页面条目解析成“条目 + API 结果”，供 Gopeed / ClassFlow 两条链路共用。
+   * @param {object} item 页面课程条目
+   * @returns {Promise<{item: object, videoInfo: any}>} 解析结果
    */
-  async function downloadByApi(item) {
-    try {
-      log('[API] 获取视频信息：', item.newId);                            // 日志：开始请求
-      const v = await getVideoInfoByNewId(item.newId);                    // 调 API 拿信息
+  async function resolveItemVideoInfo(item) {
+    log('[API] 获取视频信息：', item.newId);
+    const videoInfo = await getVideoInfoByNewId(item.newId);
+    return { item, videoInfo };
+  }
 
-      const segments = v.VideoSegmentInfo || [];                          // 课程片段列表
-      if (!segments.length) {                                             // 没有片段直接返回
-        log('[API] 无视频片段：', item.newId);                            // 日志提示
-        return;                                                           // 结束
+  /**
+   * Gopeed 模式：把一个页面条目解析出的片段逐个提交给下载器。
+   * @param {{item: object, videoInfo: any}} resolved 已解析好的课程
+   */
+  async function submitResolvedItemToGopeed(resolved) {
+    const item = resolved.item;
+    const videoInfo = resolved.videoInfo;
+    const segments = Array.isArray(videoInfo.VideoSegmentInfo) ? videoInfo.VideoSegmentInfo : [];
+    if (!segments.length) {
+      log('[API] 无视频片段：', item.newId);
+      return;
+    }
+
+    for (let i = 0; i < segments.length; i += 1) {
+      const seg = segments[i];
+      const mp4Url = pickMp4Url(seg.PlayFileUri);
+      if (!mp4Url) {
+        log('[API] 无法解析无参数 mp4 地址：', seg.PlayFileUri);
+        continue;
       }
 
-      for (let i = 0; i < segments.length; i++) {                         // 逐片段处理
-        const seg = segments[i];                                          // 当前片段
-        const mp4Url = pickMp4Url(seg.PlayFileUri);                       // 只取无参数 mp4
-
-        if (!mp4Url) {                                                    // 取不到就跳过
-          log('[API] 无法解析无参数 mp4 地址：', seg.PlayFileUri);         // 日志提示
-          continue;                                                       // 进入下一个片段
-        }
-
-        let fn = buildFilenameFromApi(v);                                 // 基础文件名
-        if (segments.length > 1) {                                        // 多片段需要区分
-          fn = fn.replace(/\.mp4$/i, `-seg${i + 1}.mp4`);                  // 追加分段后缀
-        }
-
-        log('[Gopeed] 提交下载：', fn);                                    // 日志提示
-        const r = await submitGopeedTask(mp4Url, fn);                     // 提交到 Gopeed
-        if (!r.ok) {                                                      // 提交失败
-          log('[Gopeed] 提交失败：', fn, r.status || '', r.text || '');    // 输出失败原因
-        } else {                                                          // 提交成功
-          log('[Gopeed] 已提交：', fn);                                    // 成功日志
-        }
+      let filename = buildFilenameFromApi(videoInfo);
+      if (segments.length > 1) {
+        filename = filename.replace(/\.mp4$/i, `-seg${i + 1}.mp4`);
       }
-    } catch (err) {
-      log('[API失败] 仅记录错误，不再降级：', item.newId, err.message);     // 取消降级逻辑
+
+      log('[Gopeed] 提交下载：', filename);
+      const response = await submitGopeedTask(mp4Url, filename);
+      if (!response.ok) {
+        log('[Gopeed] 提交失败：', filename, response.status || '', response.text || '');
+      } else {
+        log('[Gopeed] 已提交：', filename);
+      }
     }
   }
 
-  /******************* 队列：提交到 Gopeed（内存队列即可） *******************/
-  const __tmQueue = [];                                                   // 内存队列（本页有效）
-  const __tmQueueSet = new Set();                                         // 去重集合（按 newId）
+  /**
+   * ClassFlow 模式：把一组课程统一整理成一个 batch，再一次性投递到后端。
+   * @param {Array<{item: object, videoInfo: any}>} resolvedItems 已解析好的课程数组
+   */
+  async function submitResolvedItemsToClassFlow(resolvedItems) {
+    __tmClassFlowBaseUrl = normalizeClassFlowBaseUrl(__tmClassFlowBaseUrl);
+    if (!__tmClassFlowBaseUrl) {
+      log('[ClassFlow] 未配置后端地址，已取消提交。');
+      return;
+    }
+    if (!__tmClassFlowToken) {
+      log('[ClassFlow] 未配置 Bearer Token，已取消提交。');
+      return;
+    }
+
+    const batchBody = buildClassFlowBatchRequest({
+      resolvedItems,
+      semester: __tmClassFlowSemester
+    });
+    if (!batchBody.items.length) {
+      log('[ClassFlow] 没有可提交的视频片段，已跳过。');
+      return;
+    }
+
+    const endpoint = joinUrl(__tmClassFlowBaseUrl, CLASSFLOW_CONFIG.intakePath);
+    log('[ClassFlow] 提交 batch：', `课程数=${resolvedItems.length}`, `片段数=${batchBody.items.length}`);
+    const response = await gmRequestJson('POST', endpoint, batchBody, CLASSFLOW_CONFIG.timeoutMs, buildClassFlowHeaders());
+    if (!response.ok) {
+      log('[ClassFlow] 提交失败：', response.status || '', response.text || '');
+      return;
+    }
+
+    const batchId = response.data?.batch_id || '(未知 batch_id)';
+    const acceptedCount = Number(response.data?.accepted_count || 0);
+    log('[ClassFlow] 已提交：', `batch_id=${batchId}`, `accepted=${acceptedCount}`);
+  }
+
+  /**
+   * 按“作业”处理一整批条目。
+   *
+   * 关键点：
+   * 1. Gopeed 模式：仍然逐条、逐片段提交下载。
+   * 2. ClassFlow 模式：先把所有条目都解析出来，再一次性提交一个 batch。
+   * 3. 单个条目解析失败时，不阻断其余条目继续处理。
+   *
+   * @param {{items: Array<object>, destinationMode: 'gopeed' | 'classflow'}} job 队列作业
+   */
+  async function processJob(job) {
+    const settled = await Promise.allSettled(job.items.map((item) => resolveItemVideoInfo(item)));
+    const resolvedItems = [];
+
+    for (let index = 0; index < settled.length; index += 1) {
+      const result = settled[index];
+      const sourceItem = job.items[index];
+      if (result.status === 'fulfilled') {
+        resolvedItems.push(result.value);
+      } else {
+        log('[API失败] 仅记录错误，不再降级：', sourceItem?.newId || '(未知)', result.reason?.message || String(result.reason || '解析失败'));
+      }
+    }
+
+    if (!resolvedItems.length) {
+      log('[队列] 本次作业全部失败，未产生可投递结果。');
+      return;
+    }
+
+    if (job.destinationMode === 'classflow') {
+      await submitResolvedItemsToClassFlow(resolvedItems);
+      return;
+    }
+
+    for (const resolved of resolvedItems) {
+      await submitResolvedItemToGopeed(resolved);
+    }
+  }
+
+  /******************* 队列：按“单次作业”排队，而不是按单个 newId 排队 *******************/
+  const __tmQueue = [];                                                   // 内存队列（每项代表一次用户动作）
+  const __tmQueuedNewIdSet = new Set();                                   // 去重集合：避免同一节课被重复排进队列
   let __tmInflight = 0;                                                   // 当前进行中的数量
   const __tmConcurrency = 2;                                              // 并发提交数量（保守一点）
 
   /**
-   * 把任务加入队列（避免重复）。
-   * @param {Array<object>} items 任务列表
+   * 把一个“用户动作”加入队列。
+   * @param {Array<object>} items 本次要处理的课程列表
    */
   function enqueue(items) {
-    let added = 0;                                                        // 记录实际新增数
-    for (const it of items) {                                             // 遍历每条
-      if (__tmQueueSet.has(it.newId)) continue;                           // 已存在则跳过
-      __tmQueue.push(it);                                                 // 进入队列
-      __tmQueueSet.add(it.newId);                                         // 加入去重集合
-      added += 1;                                                         // 计数 +1
+    const acceptedItems = [];
+    for (const it of items) {
+      if (__tmQueuedNewIdSet.has(it.newId)) continue;
+      __tmQueuedNewIdSet.add(it.newId);
+      acceptedItems.push(it);
     }
-    log(`队列加入 ${added} 条，当前队列总数=${__tmQueue.length}`);          // 输出队列状态
+    if (!acceptedItems.length) {
+      log('队列未新增条目：这些课程已在队列中等待处理。');
+      return;
+    }
+
+    __tmQueue.push({
+      items: acceptedItems,
+      destinationMode: __tmDestinationMode
+    });
+    log(`队列加入 ${acceptedItems.length} 条，当前作业数=${__tmQueue.length}，模式=${__tmDestinationMode}`);
   }
 
   /**
@@ -1189,12 +1687,14 @@
     if (__tmInflight >= __tmConcurrency) return;                          // 并发满了先退出
     if (__tmQueue.length === 0) return;                                   // 队列为空直接返回
 
-    const next = __tmQueue.shift();                                       // 取出一个任务
-    __tmQueueSet.delete(next.newId);                                      // 同步去重集合
+    const next = __tmQueue.shift();                                       // 取出一个作业
+    for (const item of next.items) {                                      // 同步释放去重集合
+      __tmQueuedNewIdSet.delete(item.newId);
+    }
     __tmInflight += 1;                                                    // 并发 +1
 
     try {
-      await downloadByApi(next);                                          // 执行下载逻辑
+      await processJob(next);                                             // 执行当前作业
     } finally {
       __tmInflight = Math.max(0, __tmInflight - 1);                       // 并发 -1，防止负数
     }
@@ -1210,12 +1710,19 @@
     const rec = parseRecommendList();                                     // 解析推荐列表
 
     const info = qs('#tm_info', panel);                                   // 信息栏 DOM
-    info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 队列=${__tmQueue.length} ｜ 并发=${__tmInflight}/${__tmConcurrency} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'} ｜ Gopeed=${GOPEED_CONFIG.baseUrl} ｜ Token=${GOPEED_CONFIG.apiToken ? '已配置' : '未配置'}`; // 更新状态信息
+    const queuedItemCount = __tmQueue.reduce((sum, job) => sum + (job.items?.length || 0), 0); // 统计排队中的课程数
+    const modeLabel = __tmDestinationMode === 'classflow' ? 'ClassFlow' : 'Gopeed'; // 当前模式
+    const modeDetail = __tmDestinationMode === 'classflow'
+      ? `ClassFlow=${__tmClassFlowBaseUrl || '未配置'} ｜ Bearer=${__tmClassFlowToken ? '已配置' : '未配置'}`
+      : `Gopeed=${GOPEED_CONFIG.baseUrl} ｜ Token=${GOPEED_CONFIG.apiToken ? '已配置' : '未配置'}`;
+    info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 模式=${modeLabel} ｜ 队列作业=${__tmQueue.length} ｜ 队列课程=${queuedItemCount} ｜ 并发=${__tmInflight}/${__tmConcurrency} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'} ｜ ${modeDetail}`; // 更新状态信息
 
     __tmItemMap = new Map(rec.map(it => [it.newId, it]));                 // 建立 newId 映射
     const currentItem = rec.find(it => it.isCurrent);                     // 当前页条目（如果有）
     const otherItems = rec.filter(it => !it.isCurrent);                   // 非当前页条目
     __tmItemsByDate = groupItemsByDate(otherItems);                       // 建立日期分组（排除当前页）
+    const singleActionText = __tmDestinationMode === 'classflow' ? '提交本节' : '下载本节'; // 当前按钮文案
+    const dayActionText = __tmDestinationMode === 'classflow' ? '提交当天全部' : '下载当天全部'; // 当前按钮文案
 
     const list = qs('#tm_list', panel);                                   // 列表容器
     if (!rec.length) {                                                    // 没有条目
@@ -1238,7 +1745,7 @@
         <div class="tm-item-row">
           <div class="tm-item-meta">${escapeHtml(currentItem.meta)} <span class="tm-tag">当前页</span></div>
           <div class="tm-item-actions">
-            <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(currentItem.newId)}">下载本节</button>
+            <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(currentItem.newId)}">${singleActionText}</button>
           </div>
         </div>
         <div class="tm-item-sub">NewID：<span class="tm-mono">${escapeHtml(currentItem.newId)}</span></div>
@@ -1259,7 +1766,7 @@
           <div class="tm-item-row">                                     
             <div class="tm-item-meta">${escapeHtml(it.meta)}</div>       
             <div class="tm-item-actions">                               
-              <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(it.newId)}">下载本节</button>
+              <button class="tm-btn" type="button" data-action="download-item" data-newid="${escapeHtml(it.newId)}">${singleActionText}</button>
             </div>
           </div>
           <div class="tm-item-sub">NewID：<span class="tm-mono">${escapeHtml(it.newId)}</span></div>
@@ -1276,7 +1783,7 @@
               <div class="tm-day-sub">共 ${items.length} 节</div>
             </div>
             <div class="tm-day-actions">
-              <button class="tm-btn primary" type="button" data-action="download-day" data-date="${escapeHtml(d)}">下载当天全部</button>
+              <button class="tm-btn primary" type="button" data-action="download-day" data-date="${escapeHtml(d)}">${dayActionText}</button>
             </div>
           </summary>
           <div class="tm-day-list">
