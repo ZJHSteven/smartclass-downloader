@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed / ClassFlow 双模式投递
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.8.0
+// @version      0.8.1
 // @description  通过API获取视频信息，可批量提交到Gopeed外部下载器，或一次性投递到ClassFlow后端。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
@@ -266,11 +266,28 @@
    * @returns {Record<string, string>} 请求头对象
    */
   function buildClassFlowHeaders() {
+    return buildClassFlowHeadersForToken(__tmClassFlowToken);
+  }
+
+  /**
+   * 按给定 token 构造 ClassFlow 请求头。
+   *
+   * 这里单独抽成纯函数，有两个目的：
+   *
+   * 1. 让 Node 单测可以直接验证“空 token / 非空 token”两种分支。
+   * 2. 明确表达当前设计：token 不是永远必填。
+   *    - 直连后端时，需要填写 Bearer Token
+   *    - 走 Cloudflare Worker 时，可以留空，由 Worker 代为追加后端鉴权头
+   *
+   * @param {string} token ClassFlow Bearer Token，可为空
+   * @returns {Record<string, string>} 请求头对象
+   */
+  function buildClassFlowHeadersForToken(token) {
     const headers = {};
     headers['accept'] = 'application/json';
     headers['content-type'] = 'application/json';
-    if (__tmClassFlowToken) {
-      headers['Authorization'] = `Bearer ${__tmClassFlowToken}`;
+    if (String(token || '').trim()) {
+      headers['Authorization'] = `Bearer ${String(token).trim()}`;
     }
     return headers;
   }
@@ -806,6 +823,7 @@
   const __tmTestExports = {
     normalizeDestinationMode,
     normalizeClassFlowBaseUrl,
+    buildClassFlowHeadersForToken,
     parseDate,
     parseTimeRangeFromMeta,
     buildMp4FilenameV2,
@@ -1145,7 +1163,7 @@
         <div class="tm-settings-row">
           <div>
             <div class="tm-settings-title">投递模式</div>
-            <div class="tm-settings-note">切到 ClassFlow 后，“当天全部”会一次性提交成一个后端 batch。</div>
+            <div class="tm-settings-note">切到 ClassFlow 后，“当天全部”会一次性提交成一个后端 batch。推荐把地址填成 Worker 域名，这样 token 可以留空。</div>
           </div>
           <label class="tm-switch" title="切换 Gopeed / ClassFlow">
             <input id="tm_mode_toggle" type="checkbox">
@@ -1158,11 +1176,11 @@
         <div class="tm-settings-grid">
           <label class="tm-field tm-field--full">
             <span class="tm-field-label">ClassFlow 后端地址</span>
-            <input id="tm_classflow_base_url" class="tm-input" type="text" placeholder="https://classflow-backend.example.com">
+            <input id="tm_classflow_base_url" class="tm-input" type="text" placeholder="推荐填 Worker 域名，例如 https://classflow-web.example.workers.dev">
           </label>
           <label class="tm-field tm-field--full">
             <span class="tm-field-label">ClassFlow Bearer Token</span>
-            <input id="tm_classflow_token" class="tm-input" type="password" placeholder="粘贴后端 Bearer Token">
+            <input id="tm_classflow_token" class="tm-input" type="password" placeholder="直连后端才需要填；走 Worker 可留空">
           </label>
           <label class="tm-field">
             <span class="tm-field-label">默认学期</span>
@@ -1586,8 +1604,7 @@
       return;
     }
     if (!__tmClassFlowToken) {
-      log('[ClassFlow] 未配置 Bearer Token，已取消提交。');
-      return;
+      log('[ClassFlow] 未配置 Bearer Token：本次会按“无鉴权头”提交；只有地址指向 Worker 时这样才是正确用法。');
     }
 
     const batchBody = buildClassFlowBatchRequest({
@@ -1713,7 +1730,7 @@
     const queuedItemCount = __tmQueue.reduce((sum, job) => sum + (job.items?.length || 0), 0); // 统计排队中的课程数
     const modeLabel = __tmDestinationMode === 'classflow' ? 'ClassFlow' : 'Gopeed'; // 当前模式
     const modeDetail = __tmDestinationMode === 'classflow'
-      ? `ClassFlow=${__tmClassFlowBaseUrl || '未配置'} ｜ Bearer=${__tmClassFlowToken ? '已配置' : '未配置'}`
+      ? `ClassFlow=${__tmClassFlowBaseUrl || '未配置'} ｜ Bearer=${__tmClassFlowToken ? '已配置' : '留空(走Worker可用)'}`
       : `Gopeed=${GOPEED_CONFIG.baseUrl} ｜ Token=${GOPEED_CONFIG.apiToken ? '已配置' : '未配置'}`;
     info.textContent = `本页 NewID=${getParam('NewID') || '(无)'} ｜ 推荐条目数=${rec.length} ｜ 模式=${modeLabel} ｜ 队列作业=${__tmQueue.length} ｜ 队列课程=${queuedItemCount} ｜ 并发=${__tmInflight}/${__tmConcurrency} ｜ 已捕获MP4数=${mp4Set.size} ｜ 已捕获csrkToken=${__tmCsrkToken ? '是' : '否'} ｜ ${modeDetail}`; // 更新状态信息
 

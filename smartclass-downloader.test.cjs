@@ -29,6 +29,19 @@ test('parseTimeRangeFromMeta 应提取 HH:mm 级别时间段', () => {
   );
 });
 
+test('buildClassFlowHeadersForToken 应区分空 token 与非空 token', () => {
+  assert.deepEqual(helpers.buildClassFlowHeadersForToken(''), {
+    accept: 'application/json',
+    'content-type': 'application/json',
+  });
+
+  assert.deepEqual(helpers.buildClassFlowHeadersForToken('  shared-token  '), {
+    accept: 'application/json',
+    'content-type': 'application/json',
+    Authorization: 'Bearer shared-token',
+  });
+});
+
 test('buildClassFlowIntakeItem 应对多片段补 segment 后缀并保留元数据', () => {
   const intakeItem = helpers.buildClassFlowIntakeItem({
     item: {

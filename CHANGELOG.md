@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.8.1 - Worker 模式免手填 token（2026-03-23）
+
+### 🔐 ClassFlow 配置
+- 调整 `ClassFlow` 提交流程：当地址填的是 Cloudflare Worker 域名时，脚本允许 `Bearer Token` 留空，由 Worker 代为补后端鉴权头
+- 保留直连后端的兼容能力：如果你填的是后端 Tunnel 域名，仍然可以手工填写同一个后端 Bearer Token
+- 更新设置面板提示文案，明确“推荐填 Worker 地址，token 可留空”的使用方式
+
+### ✅ 测试
+- 新增请求头单测，覆盖 `ClassFlow` 在空 token / 非空 token 两种情况下的请求头组装
 ## v0.8.0 - ClassFlow 后端投递模式（2026-03-22）
 
 ### 🚀 新增投递模式
