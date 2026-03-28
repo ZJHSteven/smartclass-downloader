@@ -42,6 +42,34 @@ test('buildClassFlowHeadersForToken 应区分空 token 与非空 token', () => {
   });
 });
 
+test('设置区展开状态与文案应保持稳定', () => {
+  assert.equal(helpers.normalizeSettingsExpanded('1'), true);
+  assert.equal(helpers.normalizeSettingsExpanded('true'), true);
+  assert.equal(helpers.normalizeSettingsExpanded('expanded'), true);
+  assert.equal(helpers.normalizeSettingsExpanded('0'), false);
+  assert.equal(helpers.normalizeSettingsExpanded(''), false);
+
+  assert.equal(
+    helpers.buildModeHintText('classflow'),
+    '当前会把解析出的所有视频片段统一推送到 ClassFlow 后端。',
+  );
+  assert.equal(
+    helpers.buildModeHintText('gopeed'),
+    '当前会把解析出的所有视频片段继续提交给 Gopeed 下载器。',
+  );
+
+  assert.equal(
+    helpers.buildSettingsSummaryText('classflow', false),
+    '当前使用 ClassFlow 模式。配置区默认收起，第一次配好后通常不用再打开。',
+  );
+  assert.equal(
+    helpers.buildSettingsSummaryText('gopeed', true),
+    '当前使用 Gopeed 模式。配置区已展开，可直接修改地址、Token 和默认学期。',
+  );
+  assert.equal(helpers.buildSettingsToggleButtonText(false), '展开配置');
+  assert.equal(helpers.buildSettingsToggleButtonText(true), '收起配置');
+});
+
 test('buildClassFlowIntakeItem 应对多片段补 segment 后缀并保留元数据', () => {
   const intakeItem = helpers.buildClassFlowIntakeItem({
     item: {

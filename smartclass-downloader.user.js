@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧课堂：批量抓MP4 + Gopeed / ClassFlow 双模式投递
   // @namespace    https://github.com/ZJHSteven/smartclass-downloader
-// @version      0.8.1
+// @version      0.8.2
 // @description  通过API获取视频信息，可批量提交到Gopeed外部下载器，或一次性投递到ClassFlow后端。
   // @match        https://tmu.smartclass.cn/PlayPages/Video.aspx*
 // @run-at      document-start
@@ -35,11 +35,13 @@
   const CLASSFLOW_BASE_URL_STORE_KEY = 'tm_classflow_base_url_v1'; // 记录 ClassFlow 后端地址
   const CLASSFLOW_TOKEN_STORE_KEY = 'tm_classflow_token_v1'; // 记录 ClassFlow Bearer Token
   const CLASSFLOW_SEMESTER_STORE_KEY = 'tm_classflow_semester_v1'; // 记录默认学期（可为空）
+  const SETTINGS_EXPANDED_STORE_KEY = 'tm_settings_expanded_v1'; // 记录“高级配置区”是否展开
   let __tmCsrkToken = '';                  // 运行时内存缓存：优先读它，避免每次都碰 localStorage
   let __tmDestinationMode = 'gopeed';      // 默认仍保留 Gopeed，避免升级后突然切到新链路
   let __tmClassFlowBaseUrl = '';           // ClassFlow 后端基址
   let __tmClassFlowToken = '';             // ClassFlow Bearer Token
   let __tmClassFlowSemester = '';          // 默认学期
+  let __tmSettingsExpanded = false;        // 设置区默认收起，只有用户主动点开才展开
 
   // 读取历史缓存（在某些隐私模式下 localStorage 可能会抛异常，所以要 try/catch）
   if (__isBrowserRuntime) {
@@ -49,12 +51,14 @@
       __tmClassFlowBaseUrl = normalizeClassFlowBaseUrl(localStorage.getItem(CLASSFLOW_BASE_URL_STORE_KEY) || '');
       __tmClassFlowToken = String(localStorage.getItem(CLASSFLOW_TOKEN_STORE_KEY) || '').trim();
       __tmClassFlowSemester = String(localStorage.getItem(CLASSFLOW_SEMESTER_STORE_KEY) || '').trim();
+      __tmSettingsExpanded = normalizeSettingsExpanded(localStorage.getItem(SETTINGS_EXPANDED_STORE_KEY));
     } catch (e) {
       __tmCsrkToken = '';
       __tmDestinationMode = 'gopeed';
       __tmClassFlowBaseUrl = '';
       __tmClassFlowToken = '';
       __tmClassFlowSemester = '';
+      __tmSettingsExpanded = false;
     }
   }
 
@@ -214,6 +218,23 @@
   }
 
   /**
+   * 统一规范化“设置区是否展开”。
+   *
+   * 为什么单独做这个函数？
+   *
+   * 1. localStorage 里取出来的一定是字符串，不能直接当布尔值用。
+   * 2. 以后如果想兼容更多写法（例如 true / open / expanded），只改这里就行。
+   *
+   * @param {any} value 任意输入值
+   * @returns {boolean} true 表示展开；false 表示收起
+   */
+  function normalizeSettingsExpanded(value) {
+    if (value === true || value === 1) return true;
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'open' || normalized === 'expanded';
+  }
+
+  /**
    * 统一清洗 ClassFlow 基址，避免末尾斜杠导致 URL 拼接重复。
    * @param {string} value 用户输入值
    * @returns {string} 清洗后的地址
@@ -233,6 +254,62 @@
       localStorage.setItem(CLASSFLOW_TOKEN_STORE_KEY, __tmClassFlowToken);
       localStorage.setItem(CLASSFLOW_SEMESTER_STORE_KEY, __tmClassFlowSemester);
     } catch (e) {}
+  }
+
+  /**
+   * 单独持久化“设置区展开状态”。
+   *
+   * 这样做的好处是：真正的业务配置（模式 / 地址 / token / 学期）和纯 UI 状态分开存，
+   * 以后定位问题时更清晰，也不会把两种概念混在同一个函数里。
+   */
+  function persistSettingsExpandedState() {
+    if (!__isBrowserRuntime) return;
+    try {
+      localStorage.setItem(SETTINGS_EXPANDED_STORE_KEY, __tmSettingsExpanded ? '1' : '0');
+    } catch (e) {}
+  }
+
+  /**
+   * 生成“当前模式”的详细说明文字。
+   *
+   * 这段文字会展示在展开后的配置区里，目的是告诉用户：
+   * 当前切到哪种模式后，后续“下载本节 / 下载当天全部”按钮到底会做什么。
+   *
+   * @param {'gopeed' | 'classflow'} mode 当前模式
+   * @returns {string} 适合直接渲染到 UI 的说明文案
+   */
+  function buildModeHintText(mode) {
+    return normalizeDestinationMode(mode) === 'classflow'
+      ? '当前会把解析出的所有视频片段统一推送到 ClassFlow 后端。'
+      : '当前会把解析出的所有视频片段继续提交给 Gopeed 下载器。';
+  }
+
+  /**
+   * 生成“设置区摘要”文案。
+   *
+   * 摘要的目标不是替代完整配置，而是在默认收起时给用户一句足够清晰的状态提示：
+   * - 当前选的是 Gopeed 还是 ClassFlow
+   * - 配置区现在是收起还是展开
+   *
+   * @param {'gopeed' | 'classflow'} mode 当前模式
+   * @param {boolean} expanded 设置区是否展开
+   * @returns {string} 摘要文案
+   */
+  function buildSettingsSummaryText(mode, expanded) {
+    const modeLabel = normalizeDestinationMode(mode) === 'classflow' ? 'ClassFlow' : 'Gopeed';
+    return expanded
+      ? `当前使用 ${modeLabel} 模式。配置区已展开，可直接修改地址、Token 和默认学期。`
+      : `当前使用 ${modeLabel} 模式。配置区默认收起，第一次配好后通常不用再打开。`;
+  }
+
+  /**
+   * 生成“展开 / 收起配置”按钮文案。
+   *
+   * @param {boolean} expanded 设置区是否展开
+   * @returns {string} 按钮文案
+   */
+  function buildSettingsToggleButtonText(expanded) {
+    return expanded ? '收起配置' : '展开配置';
   }
 
   /**
@@ -822,7 +899,11 @@
    */
   const __tmTestExports = {
     normalizeDestinationMode,
+    normalizeSettingsExpanded,
     normalizeClassFlowBaseUrl,
+    buildModeHintText,
+    buildSettingsSummaryText,
+    buildSettingsToggleButtonText,
     buildClassFlowHeadersForToken,
     parseDate,
     parseTimeRangeFromMeta,
@@ -912,11 +993,27 @@
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    #tm_panel .tm-settings-main {
+      flex: 1 1 220px;
+      min-width: 0;
+    }
+    #tm_panel .tm-settings-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }
     #tm_panel .tm-settings-title {
       font-weight: 900;
       color: #ffffff;
+    }
+    #tm_panel .tm-settings-fields {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.10);
     }
     #tm_panel .tm-settings-grid {
       display: grid;
@@ -1022,6 +1119,11 @@
       border-color: rgba(255, 255, 255, 0.22);
     }
     #tm_panel .tm-btn.ghost { background: transparent; }
+    #tm_panel .tm-btn.tm-btn--compact {
+      padding: 6px 10px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
 
     #tm_panel .tm-help {
       padding: 10px;
@@ -1161,34 +1263,40 @@
 
       <div class="tm-settings">
         <div class="tm-settings-row">
-          <div>
+          <div class="tm-settings-main">
             <div class="tm-settings-title">投递模式</div>
-            <div class="tm-settings-note">切到 ClassFlow 后，“当天全部”会一次性提交成一个后端 batch。推荐把地址填成 Worker 域名，这样 token 可以留空。</div>
+            <div id="tm_settings_summary" class="tm-settings-note"></div>
           </div>
-          <label class="tm-switch" title="切换 Gopeed / ClassFlow">
-            <input id="tm_mode_toggle" type="checkbox">
-            <span class="tm-switch-track"></span>
-            <span class="tm-switch-thumb"></span>
-            <span class="tm-switch-labels"><span>Gopeed</span><span>ClassFlow</span></span>
-          </label>
+          <div class="tm-settings-actions">
+            <label class="tm-switch" title="切换 Gopeed / ClassFlow">
+              <input id="tm_mode_toggle" type="checkbox">
+              <span class="tm-switch-track"></span>
+              <span class="tm-switch-thumb"></span>
+              <span class="tm-switch-labels"><span>Gopeed</span><span>ClassFlow</span></span>
+            </label>
+            <button id="tm_toggle_settings" class="tm-btn ghost tm-btn--compact" type="button" aria-expanded="false">展开配置</button>
+          </div>
         </div>
 
-        <div class="tm-settings-grid">
-          <label class="tm-field tm-field--full">
-            <span class="tm-field-label">ClassFlow 后端地址</span>
-            <input id="tm_classflow_base_url" class="tm-input" type="text" placeholder="推荐填 Worker 域名，例如 https://classflow-web.example.workers.dev">
-          </label>
-          <label class="tm-field tm-field--full">
-            <span class="tm-field-label">ClassFlow Bearer Token</span>
-            <input id="tm_classflow_token" class="tm-input" type="password" placeholder="直连后端才需要填；走 Worker 可留空">
-          </label>
-          <label class="tm-field">
-            <span class="tm-field-label">默认学期</span>
-            <input id="tm_classflow_semester" class="tm-input" type="text" placeholder="2025-2026-2">
-          </label>
-          <div class="tm-field">
-            <span class="tm-field-label">模式说明</span>
-            <div id="tm_mode_hint" class="tm-settings-note"></div>
+        <div id="tm_settings_fields" class="tm-settings-fields" hidden>
+          <div class="tm-settings-note">切到 ClassFlow 后，“当天全部”会一次性提交成一个后端 batch。推荐把地址填成 Worker 域名，这样 token 可以留空。</div>
+          <div class="tm-settings-grid">
+            <label class="tm-field tm-field--full">
+              <span class="tm-field-label">ClassFlow 后端地址</span>
+              <input id="tm_classflow_base_url" class="tm-input" type="text" placeholder="推荐填 Worker 域名，例如 https://classflow-web.example.workers.dev">
+            </label>
+            <label class="tm-field tm-field--full">
+              <span class="tm-field-label">ClassFlow Bearer Token</span>
+              <input id="tm_classflow_token" class="tm-input" type="password" placeholder="直连后端才需要填；走 Worker 可留空">
+            </label>
+            <label class="tm-field">
+              <span class="tm-field-label">默认学期</span>
+              <input id="tm_classflow_semester" class="tm-input" type="text" placeholder="2025-2026-2">
+            </label>
+            <div class="tm-field">
+              <span class="tm-field-label">模式说明</span>
+              <div id="tm_mode_hint" class="tm-settings-note"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -1275,10 +1383,28 @@
   qs('#tm_clear', panel).addEventListener('click', () => clearLogs());     // 清空按钮
 
   const modeToggleEl = qs('#tm_mode_toggle', panel);
+  const settingsSummaryEl = qs('#tm_settings_summary', panel);
+  const toggleSettingsEl = qs('#tm_toggle_settings', panel);
+  const settingsFieldsEl = qs('#tm_settings_fields', panel);
   const modeHintEl = qs('#tm_mode_hint', panel);
   const classFlowBaseUrlEl = qs('#tm_classflow_base_url', panel);
   const classFlowTokenEl = qs('#tm_classflow_token', panel);
   const classFlowSemesterEl = qs('#tm_classflow_semester', panel);
+
+  /**
+   * 把“配置区展开/收起状态”同步到 UI。
+   *
+   * 这里单独拆出来，原因是：
+   * 1. 模式变化时，需要顺手刷新摘要文案；
+   * 2. 点击“展开配置”按钮时，也需要刷新按钮文案与 aria-expanded；
+   * 3. 把这部分逻辑聚合到一起，后续加动画或图标都更容易维护。
+   */
+  function syncSettingsPanelUI() {
+    settingsSummaryEl.textContent = buildSettingsSummaryText(__tmDestinationMode, __tmSettingsExpanded);
+    settingsFieldsEl.hidden = !__tmSettingsExpanded;
+    toggleSettingsEl.textContent = buildSettingsToggleButtonText(__tmSettingsExpanded);
+    toggleSettingsEl.setAttribute('aria-expanded', __tmSettingsExpanded ? 'true' : 'false');
+  }
 
   /**
    * 把当前运行时配置同步到设置面板。
@@ -1288,9 +1414,8 @@
     classFlowBaseUrlEl.value = __tmClassFlowBaseUrl;
     classFlowTokenEl.value = __tmClassFlowToken;
     classFlowSemesterEl.value = __tmClassFlowSemester;
-    modeHintEl.textContent = __tmDestinationMode === 'classflow'
-      ? '当前会把解析出的所有视频片段统一推送到 ClassFlow 后端。'
-      : '当前会把解析出的所有视频片段继续提交给 Gopeed 下载器。';
+    modeHintEl.textContent = buildModeHintText(__tmDestinationMode);
+    syncSettingsPanelUI();
   }
 
   /**
@@ -1314,6 +1439,11 @@
   classFlowBaseUrlEl.addEventListener('change', () => handleSettingsChanged());
   classFlowTokenEl.addEventListener('change', () => handleSettingsChanged());
   classFlowSemesterEl.addEventListener('change', () => handleSettingsChanged());
+  toggleSettingsEl.addEventListener('click', () => {
+    __tmSettingsExpanded = !__tmSettingsExpanded;
+    persistSettingsExpandedState();
+    syncSettingsPanelUI();
+  });
   syncSettingsUI();
 
   // 面板折叠/展开：给屏幕留空间（把状态存到 localStorage，刷新后还能记住）
